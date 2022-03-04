@@ -59,7 +59,7 @@ jobs:
 
     steps:
     - name: "SCM Checkout" 
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Add msbuild to PATH
       if: startsWith(matrix.target, 'win')
@@ -302,7 +302,7 @@ jobs:
 
     - name: "SCM Checkout" 
       # only required by "hub release create" to prevent "fatal: Not a git repository"
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: "Get: all build artifacts"
       uses: actions/download-artifact@v2
