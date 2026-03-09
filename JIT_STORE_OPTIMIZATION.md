@@ -69,7 +69,7 @@ dropped, so the stack is guaranteed current. No changes to `fetch()` are needed.
 
 There are 3 code patterns that drop register bindings:
 
-1. **`scratch()`** -- 45 call sites throughout the file
+1. **`scratch()`** -- ~58 call sites throughout the file
 2. **`alloc_reg()` eviction** -- 2 sites that inline the drop instead of calling `scratch()`
 3. **`discard_regs()`** -- 1 function (8 call sites) that loops over all registers
 
@@ -102,7 +102,7 @@ static void scratch_impl( jit_ctx *ctx, preg *r ) {
 
 This changes zero call sites. The macro captures `ctx` from the enclosing scope.
 
-Alternative: add `ctx` as an explicit parameter and mechanically update all 45 call sites
+Alternative: add `ctx` as an explicit parameter and mechanically update all ~58 call sites
 (`scratch(x)` -> `scratch(ctx, x)`). More principled, larger diff, same result.
 
 ### Known issue: `OAsm` case 3 clobber
@@ -128,7 +128,7 @@ case 3: // write vm reg
 ```
 
 This is the ONLY call site with this pattern. All other scratch() sites are safe:
-- ~38 sites: scratch evicts a vreg whose value matters -- flush is correct and necessary
+- ~51 sites: scratch evicts a vreg whose value matters -- flush is correct and necessary
 - 2 sites (lines 1097, 1148): value was just MOV'd to another register -- flush is redundant
   but harmless (writes same value to stack, then vreg is rebound to the new register)
 - 3 sites (lines 1295, 1299, 1303): `store_result` x86-32 -- flush writes old value, then FSTP
@@ -369,7 +369,7 @@ instruction stream, and cause the register allocator to see inconsistent binding
 | Stale dirty flag | `dirty=true` but value is actually in stack | Redundant flush emitted | Performance waste only |
 | False clean | `dirty=false` but stack is actually stale | No flush when needed | Silent corruption |
 
-The macro approach eliminates "missed flush" for all 45 scratch() sites. "Over-flush" has exactly
+The macro approach eliminates "missed flush" for all ~58 scratch() sites. "Over-flush" has exactly
 1 known instance (OAsm case 3, fixed by reordering). "Stale dirty flag" is harmless. "False clean"
 can only happen if something writes to a register without going through `store()` -- review needed
 but no such path has been identified.
@@ -415,6 +415,129 @@ whether it was dirty.
 
 ---
 
+## Code Review Findings
+
+The following findings were produced by cross-referencing every claim in this plan against the
+actual source code in `src/jit.c` (4730 lines).
+
+### Verified correct
+
+| Claim | Actual code | Status |
+|---|---|---|
+| `store()` unconditionally calls `copy()` to stack | Line 1281: `v = copy(ctx,&r->stack,v,r->size);` | Confirmed |
+| `scratch()` is pure metadata, no code emission | Lines 1019-1025: clears pointers only | Confirmed |
+| `alloc_reg()` eviction inlines binding drops | CPU: lines 973-977, FPU: lines 997-1001 | Confirmed |
+| `discard_regs()` clears scratch + XMM bindings | Lines 1347-1363 | Confirmed |
+| `reg_bind()` transitions vreg without unbinding | Lines 1060-1065: sets `r->current->holds = NULL` then immediately `r->current = p` | Confirmed |
+| OAsm case 3 has copy-then-scratch ordering | Lines 4525-4529 | Confirmed |
+| `r->current != v` check exists in original `store()` | Line 1284: `if( bind && r->current != v && ... )` | Confirmed |
+| Merge fallthrough at end of opcode loop | Lines 4550-4553: `discard_regs` then `BUF_POS()` | Confirmed |
+| `save_regs`/`restore_regs` snapshot bindings only | Lines 420-439 | Confirmed |
+| `flush_vreg` → `copy()` path is re-entrancy safe | `copy(RSTACK, RCPU/RFPU)` emits direct MOV, never calls `alloc_reg()` | Confirmed |
+
+### Corrections to original plan
+
+1. **scratch() call site count**: The plan stated "45 call sites." Actual count from grep is **~58
+   call sites**. This is not a correctness concern -- more sites means the macro approach is even
+   more valuable. All counts in this document have been updated.
+
+2. **`flush_all_dirty()` scope vs callee-saved registers**: The proposed `flush_all_dirty()` only
+   iterates scratch registers (`RCPU_SCRATCH_REGS`) and XMM registers. This is consistent with
+   `discard_regs()` which has the same scope. Callee-saved registers are never discarded at merge
+   points, so they do not need flushing in `flush_all_dirty()`. **No change needed.**
+
+3. **Direct `&r->stack` read sites**: Some sites listed in step 8 (ORef, make_dyn_cast, OCallMethod,
+   OToDyn) were described at approximate line numbers. The actual sites should be located by
+   searching for `&r->stack` or `&rb->stack` or `&ra->stack` or `&dst->stack` patterns during
+   implementation, not by line number alone. The listed sites are directionally correct but
+   line numbers may have drifted from the version used to write this plan.
+
+4. **`register_jump()` direct XJump sites**: The plan said "~3-5 direct XJump sites." Actual direct
+   `XJump` → `register_jump` patterns outside `do_jump()`:
+   - Line 3135: OJFalse/OJTrue/OJNull/OJNotNull
+   - Line 4365: OTrap (`do_jump` is used here, so actually covered)
+   - Line 4444: OSwitch loop
+
+   Plus `op_jump()` (line 3149) calls `do_jump()` internally, so those are covered. The actual
+   count of sites needing manual `flush_all_dirty()` calls is **2** (OJFalse/OJTrue/OJNull block
+   and OSwitch), not 3-5.
+
+5. **`discard_regs` at OLabel**: The plan mentions `discard_regs` at OLabel (~line 3844). There are
+   also `discard_regs` calls at lines 3820 and 3844 in the OLabel/OTrap region. Both need
+   `flush_all_dirty()` before them if they can be reached by fallthrough.
+
+### Exception paths (OTrap/OEndTrap)
+
+The `OTrap` at line 4365 uses `do_jump()` which will get the flush via step 6b. The `setjmp`-based
+trap mechanism means execution can resume at the trap target from arbitrary points. This is already
+handled by `discard_regs` at the catch site (which forces reload from stack), and flush-before-jump
+covers the source side. No additional concern, but deserves targeted testing with try/catch in hot
+loops.
+
+---
+
+## Debug Mode: Dirty Flag Assertions
+
+Add a debug assertion inside `discard_regs()` to catch missed flush paths. This should be enabled
+during development and testing, then compiled out for release.
+
+```c
+static void discard_regs( jit_ctx *ctx, bool native_call ) {
+    int i;
+    for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
+        preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+        if( r->holds ) {
+#           ifdef JIT_DEBUG_DIRTY
+            if( r->holds->dirty )
+                printf("BUG: dirty vreg %d discarded without flush (reg %d)\n",
+                    (int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i]);
+            ASSERT(!r->holds->dirty);
+#           endif
+            r->holds->current = NULL;
+            r->holds = NULL;
+        }
+    }
+    for(i=0;i<RFPU_COUNT;i++) {
+        preg *r = ctx->pregs + XMM(i);
+        if( r->holds ) {
+#           ifdef JIT_DEBUG_DIRTY
+            if( r->holds->dirty )
+                printf("BUG: dirty vreg %d discarded without flush (xmm%d)\n",
+                    (int)(r->holds - ctx->vregs), i);
+            ASSERT(!r->holds->dirty);
+#           endif
+            r->holds->current = NULL;
+            r->holds = NULL;
+        }
+    }
+}
+```
+
+This catches the "missed flush" failure mode immediately at compile time (JIT compile time, not
+C compile time). Any `discard_regs()` call that encounters a dirty vreg means a `flush_all_dirty()`
+call was missed upstream. The `printf` identifies the exact vreg and register, making the bug
+trivially locatable.
+
+Enable with `-DJIT_DEBUG_DIRTY` during development. Remove or leave as dead code in release.
+
+Additionally, consider a complementary assertion in `fetch()`:
+
+```c
+static preg *fetch( vreg *r ) {
+    if( r->current )
+        return r->current;
+#   ifdef JIT_DEBUG_DIRTY
+    ASSERT(!r->dirty);  // if unbound, stack must be current
+#   endif
+    return &r->stack;
+}
+```
+
+This catches "false clean" bugs: if a vreg has no register binding but is still marked dirty,
+something went wrong (binding was dropped without clearing the flag).
+
+---
+
 ## Summary
 
 | What | Where | Call-site changes |
@@ -425,11 +548,12 @@ whether it was dirty.
 | Keep `discard_regs()` pure | No code emission inside function | 0 |
 | Add flush in `alloc_reg()` eviction | 2 sites in `alloc_reg()` | 0 |
 | Add `flush_all_dirty()` before calls | `call_native()` / `op_call_fun()` / similar | ~2-4 one-liners |
-| Add `flush_all_dirty()` before jumps | `do_jump()` + ~3-5 direct `XJump` sites | ~4-6 one-liners |
-| Add `flush_all_dirty()` at merge fallthrough | line ~4552 + `OLabel` | 2 one-liners |
+| Add `flush_all_dirty()` before jumps | `do_jump()` + 2 direct `XJump` sites | 3 one-liners |
+| Add `flush_all_dirty()` at merge fallthrough | line ~4552 + `OLabel` | 2-3 one-liners |
 | Fix `OAsm` case 3 ordering | 1 line swap | 1 |
 | Guard direct `&r->stack` reads | ~5 sites | ~5 one-liners |
 | Flush before `save_regs()` | 2 call sites | 2 one-liners |
 | Clear dirty in `restore_regs()` | Inside function | 1 line |
 | Modify `store()` to defer | `store()` body | 0 |
-| **Total** | | **~17-21 one-line additions + 3 function rewrites** |
+| Add debug assertions | `discard_regs()` + `fetch()` | 2 (ifdef-guarded) |
+| **Total** | | **~18-21 one-line additions + 3 function rewrites** |
