@@ -218,6 +218,7 @@ struct vreg {
 	hl_type *t;
 	preg *current;
 	preg stack;
+	bool dirty;
 };
 
 #define REG_AT(i)		(ctx->pregs + (i))
@@ -427,8 +428,10 @@ static void save_regs( jit_ctx *ctx ) {
 
 static void restore_regs( jit_ctx *ctx ) {
 	int i;
-	for(i=0;i<ctx->maxRegs;i++)
+	for(i=0;i<ctx->maxRegs;i++) {
 		ctx->vregs[i].current = NULL;
+		ctx->vregs[i].dirty = false;
+	}
 	for(i=0;i<REG_COUNT;i++) {
 		vreg *r = ctx->savedRegs[i];
 		preg *p = ctx->pregs + i;
@@ -971,6 +974,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				if( k == RCPU_CALL && is_call_reg(p) ) continue;
 				if( k == RCPU_8BITS && !is_reg8(p) ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -995,6 +999,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				preg *p = PXMM((i + off)%count);
 				if( p->lock >= ctx->currentPos ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1013,18 +1018,30 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 static preg *fetch( vreg *r ) {
 	if( r->current )
 		return r->current;
+#	ifdef JIT_DEBUG_DIRTY
+	ASSERT(!r->dirty);
+#	endif
 	return &r->stack;
 }
 
-static void scratch( preg *r ) {
+static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+
+static void flush_vreg( jit_ctx *ctx, vreg *r ) {
+	if( r->dirty && r->current ) {
+		copy(ctx, &r->stack, r->current, r->size);
+		r->dirty = false;
+	}
+}
+
+static void scratch_impl( jit_ctx *ctx, preg *r ) {
 	if( r && r->holds ) {
+		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 		r->holds = NULL;
 		r->lock = 0;
 	}
 }
-
-static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+#define scratch(r) scratch_impl(ctx, r)
 
 static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 	preg *from = fetch(v);
@@ -1278,13 +1295,20 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 		r->current->holds = NULL;
 		r->current = NULL;
 	}
-	v = copy(ctx,&r->stack,v,r->size);
-	if( IS_FLOAT(r) != (v->kind == RFPU) )
-		ASSERT(0);
-	if( bind && r->current != v && (v->kind == RCPU || v->kind == RFPU) ) {
-		scratch(v);
-		r->current = v;
-		v->holds = r;
+	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		if( r->current != v ) {
+			scratch(v);
+			r->current = v;
+			v->holds = r;
+		}
+		r->dirty = true;
+	} else {
+		v = copy(ctx,&r->stack,v,r->size);
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		r->dirty = false;
 	}
 }
 
@@ -1349,6 +1373,13 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
+#			ifdef JIT_DEBUG_DIRTY
+			if( r->holds->dirty )
+				printf("BUG: dirty vreg %d discarded without flush (reg %d)\n",
+					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i]);
+			ASSERT(!r->holds->dirty);
+#			endif
+			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
 		}
@@ -1356,9 +1387,28 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RFPU_COUNT;i++) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
+#			ifdef JIT_DEBUG_DIRTY
+			if( r->holds->dirty )
+				printf("BUG: dirty vreg %d discarded without flush (xmm%d)\n",
+					(int)(r->holds - ctx->vregs), i);
+			ASSERT(!r->holds->dirty);
+#			endif
+			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
 		}
+	}
+}
+
+static void flush_all_dirty( jit_ctx *ctx ) {
+	int i;
+	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
+		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+		if( r->holds ) flush_vreg(ctx, r->holds);
+	}
+	for(i=0;i<RFPU_COUNT;i++) {
+		preg *r = ctx->pregs + XMM(i);
+		if( r->holds ) flush_vreg(ctx, r->holds);
 	}
 }
 
@@ -1544,6 +1594,7 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 
 static void op_call( jit_ctx *ctx, preg *r, int size ) {
 	preg p;
+	flush_all_dirty(ctx);
 #	ifdef JIT_DEBUG
 	if( IS_64 && size >= 0 ) {
 		int jchk;
@@ -1980,6 +2031,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 
 static int do_jump( jit_ctx *ctx, hl_op op, bool isFloat ) {
 	int j;
+	flush_all_dirty(ctx);
 	switch( op ) {
 	case OJAlways:
 		XJump(JAlways,j);
@@ -2893,6 +2945,7 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 		set_native_arg(ctx, pconst64(&p,(int_val)v->t));
 		break;
 	}
+	flush_vreg(ctx, v);
 	tmp = alloc_native_arg(ctx);
 	op64(ctx,MOV,tmp,REG_AT(Ebp));
 	if( v->stackPos >= 0 )
@@ -2939,6 +2992,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->t = f->regs[i];
 		r->size = hl_type_size(r->t);
 		r->current = NULL;
+		r->dirty = false;
 		r->stack.holds = NULL;
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
@@ -3132,6 +3186,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			{
 				preg *r = dst->t->kind == HBOOL ? alloc_cpu8(ctx, dst, true) : alloc_cpu(ctx, dst, true);
 				op64(ctx, dst->t->kind == HBOOL ? TEST8 : TEST, r, r);
+				flush_all_dirty(ctx);
 				XJump( o->op == OJFalse || o->op == OJNull ? JZero : JNotZero,jump);
 				register_jump(ctx,jump,(opCount + 1) + o->p2);
 			}
@@ -3451,6 +3506,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				op32(ctx,TEST,tmp,tmp);
 				scratch(tmp);
 				XJump_small(JNotZero,jhasvalue);
+				flush_all_dirty(ctx);
 				save_regs(ctx);
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
 				preg *rr = r;
@@ -3733,6 +3789,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					preg *r = alloc_reg(ctx,RCPU_CALL);
 					op64(ctx,MOV,r,pmem(&p,v->id,sizeof(vvirtual)+HL_WSIZE*o->p2));
 					op64(ctx,TEST,r,r);
+					flush_all_dirty(ctx);
 					save_regs(ctx);
 
 					if( o->p3 < 6 ) {
@@ -3757,6 +3814,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 							} else
 								obj_in_args = true;
 						} else {
+							flush_vreg(ctx, a);
 							preg *r2 = alloc_reg(ctx,RCPU);
 							op64(ctx,LEA,r2,&a->stack);
 							op64(ctx,MOV,pmem(&p,r->id,i*HL_WSIZE),r2);
@@ -3841,6 +3899,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			break;
 		case OLabel:
 			// NOP for now
+			flush_all_dirty(ctx);
 			discard_regs(ctx,false);
 			break;
 		case OGetI8:
@@ -4416,6 +4475,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				preg *r = alloc_cpu(ctx, dst, true);
 				preg *r2 = alloc_reg(ctx, RCPU);
 				op32(ctx, CMP, r, pconst(&p,o->p2));
+				flush_all_dirty(ctx);
 				XJump(JUGte,jdefault);
 				// r2 = r * 5 + eip
 #				ifdef HL_64
@@ -4519,13 +4579,14 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					break;
 				case 2: // read vm reg
 					rb--;
+					flush_vreg(ctx, rb);
 					copy(ctx, REG_AT(o->p2), &rb->stack, rb->size);
 					scratch(REG_AT(o->p2));
 					break;
 				case 3: // write vm reg
 					rb--;
-					copy(ctx, &rb->stack, REG_AT(o->p2), rb->size);
 					scratch(rb->current);
+					copy(ctx, &rb->stack, REG_AT(o->p2), rb->size);
 					break;
 				case 4:
 					if( ctx->totalRegsSize != 0 )
@@ -4548,8 +4609,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			break;
 		}
 		// we are landing at this position, assume we have lost our registers
-		if( ctx->opsPos[opCount+1] == -1 )
+		if( ctx->opsPos[opCount+1] == -1 ) {
+			flush_all_dirty(ctx);
 			discard_regs(ctx,true);
+		}
 		ctx->opsPos[opCount+1] = BUF_POS();
 
 		// write debug infos
