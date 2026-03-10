@@ -1320,8 +1320,8 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 			v->holds = r;
 		}
 		r->dirty = defer_counter;
-		if( defer_counter == 0)  // REMOVE
-			printf("DEFER #168: vreg %d -> reg %d, f%d op%d bufpos=%d\n",
+		if( defer_counter == DEFER_UPTO)
+			printf("DEFER #%d: vreg %d -> reg %d, f%d op%d bufpos=%d\n", DEFER_UPTO,
 				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS());
 		return;
 	}
