@@ -32,6 +32,7 @@
 
 #ifdef HL_DEBUG
 #	define JIT_DEBUG
+#	define JIT_DEBUG_DIRTY
 #endif
 
 typedef enum {
@@ -218,6 +219,7 @@ struct vreg {
 	hl_type *t;
 	preg *current;
 	preg stack;
+	int dirty; // [OPT step 1] Write-back dirty flag: nonzero=defer_counter that set it, 0=clean
 };
 
 #define REG_AT(i)		(ctx->pregs + (i))
@@ -427,8 +429,10 @@ static void save_regs( jit_ctx *ctx ) {
 
 static void restore_regs( jit_ctx *ctx ) {
 	int i;
-	for(i=0;i<ctx->maxRegs;i++)
+	for(i=0;i<ctx->maxRegs;i++) {
 		ctx->vregs[i].current = NULL;
+		ctx->vregs[i].dirty = false; // [OPT step 9] Clear dirty flags so restored snapshot starts clean
+	}
 	for(i=0;i<REG_COUNT;i++) {
 		vreg *r = ctx->savedRegs[i];
 		preg *p = ctx->pregs + i;
@@ -944,6 +948,17 @@ static bool is_call_reg( preg *p ) {
 #	endif
 }
 
+static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+
+// [OPT step 2] Write dirty register value back to its stack slot.
+// Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
+static void flush_vreg( jit_ctx *ctx, vreg *r ) {
+	if( r->dirty && r->current && r->size > 0 ) {
+		copy(ctx, &r->stack, r->current, r->size);
+	}
+	r->dirty = false;
+}
+
 static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 	int i;
 	preg *p;
@@ -971,6 +986,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				if( k == RCPU_CALL && is_call_reg(p) ) continue;
 				if( k == RCPU_8BITS && !is_reg8(p) ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -995,6 +1011,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				preg *p = PXMM((i + off)%count);
 				if( p->lock >= ctx->currentPos ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1013,23 +1030,31 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 static preg *fetch( vreg *r ) {
 	if( r->current )
 		return r->current;
+#	ifdef JIT_DEBUG_DIRTY
+	if( r->dirty ) ASSERT(0); // [OPT debug] If unbound, stack must be current (catch false-clean bugs)
+#	endif
 	return &r->stack;
 }
 
-static void scratch( preg *r ) {
+// [OPT step 3] Flush-aware scratch: flushes dirty vreg before dropping its register binding.
+// Macro captures `ctx` from enclosing scope so all ~58 call sites need zero changes.
+static void scratch_impl( jit_ctx *ctx, preg *r ) {
 	if( r && r->holds ) {
+		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 		r->holds = NULL;
 		r->lock = 0;
 	}
 }
-
-static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+#define scratch(r) scratch_impl(ctx, r)
 
 static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 	preg *from = fetch(v);
 	if( from == r || v->size == 0 ) return;
-	if( r->holds ) r->holds->current = NULL;
+	if( r->holds ) {
+		flush_vreg(ctx, r->holds);
+		r->holds->current = NULL;
+	}
 	if( v->current ) {
 		v->current->holds = NULL;
 		from = r;
@@ -1273,11 +1298,32 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	return NULL;
 }
 
+static int defer_counter = 0;
+// 926 works, 927 crashes
+#define DEFER_UPTO 927
+
+
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
 		r->current->holds = NULL;
 		r->current = NULL;
 	}
+	if( bind && (v->kind == RCPU || v->kind == RFPU) && ++defer_counter <= DEFER_UPTO ) {
+		// Deferred path: no copy, register is authoritative
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		if( r->current != v ) {
+			scratch(v);
+			r->current = v;
+			v->holds = r;
+		}
+		r->dirty = defer_counter;
+		if( defer_counter == DEFER_UPTO)
+			printf("DEFER #%d: vreg %d -> reg %d, f%d op%d bufpos=%d\n", DEFER_UPTO,
+				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS());
+		return;
+	}
+	// Original path: copy first, then bind
 	v = copy(ctx,&r->stack,v,r->size);
 	if( IS_FLOAT(r) != (v->kind == RFPU) )
 		ASSERT(0);
@@ -1286,6 +1332,7 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 		r->current = v;
 		v->holds = r;
 	}
+	r->dirty = false;
 }
 
 static void store_result( jit_ctx *ctx, vreg *r ) {
@@ -1359,6 +1406,21 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 			r->holds->current = NULL;
 			r->holds = NULL;
 		}
+	}
+}
+
+// [OPT step 6] Flush all dirty scratch+XMM registers to stack.
+// Called before calls (6a), branches (6b), and merge-point fallthroughs (6c).
+// Only iterates scratch registers -- callee-saved are never discarded at merge points.
+static void flush_all_dirty( jit_ctx *ctx ) {
+	int i;
+	for(i=0;i<RCPU_COUNT;i++) {
+		preg *r = ctx->pregs + i;
+		if( r->holds ) flush_vreg(ctx, r->holds);
+	}
+	for(i=0;i<RFPU_COUNT;i++) {
+		preg *r = ctx->pregs + XMM(i);
+		if( r->holds ) flush_vreg(ctx, r->holds);
 	}
 }
 
@@ -1544,6 +1606,7 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 
 static void op_call( jit_ctx *ctx, preg *r, int size ) {
 	preg p;
+	flush_all_dirty(ctx); // Flush after args are loaded but before CALL clobbers scratch regs
 #	ifdef JIT_DEBUG
 	if( IS_64 && size >= 0 ) {
 		int jchk;
@@ -1566,6 +1629,8 @@ static void call_native( jit_ctx *ctx, void *nativeFun, int size ) {
 	bool isExc = nativeFun == hl_assert || nativeFun == hl_throw || nativeFun == on_jit_error;
 	preg p;
 	// native function, already resolved
+	flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush BEFORE clobbering EAX with function pointer
+	scratch(PEAX);
 	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)nativeFun));
 	op_call(ctx,PEAX, isExc ? -1 : size);
 	if( isExc )
@@ -1576,6 +1641,7 @@ static void call_native( jit_ctx *ctx, void *nativeFun, int size ) {
 static void op_call_fun( jit_ctx *ctx, vreg *dst, int findex, int count, int *args ) {
 	int fid = findex < 0 ? -1 : ctx->m->functions_indexes[findex];
 	bool isNative = fid >= ctx->m->code->nfunctions;
+	flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush BEFORE prepare_call_args clobbers registers
 	int size = prepare_call_args(ctx,count,args,ctx->vregs,0);
 	preg p;
 	if( fid < 0 ) {
@@ -1602,6 +1668,7 @@ static void op_call_fun( jit_ctx *ctx, vreg *dst, int findex, int count, int *ar
 			ctx->calls = j;
 			op_call(ctx,pconst(&p,0), size);
 		}
+		flush_all_dirty(ctx);
 		discard_regs(ctx, false);
 	}
 	if( dst )
@@ -1658,6 +1725,7 @@ static void call_native_consts( jit_ctx *ctx, void *nativeFun, int_val *args, in
 	preg p;
 	int i;
 #	ifdef HL_64
+	flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush BEFORE clobbering CALL_REGS with const args
 	for(i=0;i<nargs;i++)
 		op64(ctx, MOV, REG_AT(CALL_REGS[i]), pconst64(&p, args[i]));
 #	else
@@ -1666,6 +1734,28 @@ static void call_native_consts( jit_ctx *ctx, void *nativeFun, int_val *args, in
 #	endif
 	call_native(ctx, nativeFun, size);
 }
+
+#ifdef JIT_DEBUG_DIRTY
+#define JIT_TRACE_SIZE 64
+static int jit_trace_buf[JIT_TRACE_SIZE];
+static int jit_trace_pos = 0;
+
+static void jit_trace( int_val uid ) {
+	jit_trace_buf[jit_trace_pos % JIT_TRACE_SIZE] = (int)uid;
+	jit_trace_pos++;
+}
+
+static void jit_trace_dump( void ) {
+	int i;
+	int start = jit_trace_pos > JIT_TRACE_SIZE ? jit_trace_pos - JIT_TRACE_SIZE : 0;
+	printf("=== Last %d opcodes ===\n", jit_trace_pos - start);
+	for(i = start; i < jit_trace_pos; i++) {
+		int uid = jit_trace_buf[i % JIT_TRACE_SIZE];
+		printf("  f%d op%d\n", uid >> 16, uid & 0xFFFF);
+	}
+	fflush(stdout);
+}
+#endif
 
 static void on_jit_error( const char *msg, int_val line ) {
 	char buf[256];
@@ -1980,6 +2070,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 
 static int do_jump( jit_ctx *ctx, hl_op op, bool isFloat ) {
 	int j;
+	flush_all_dirty(ctx); // [OPT step 6b] Pre-jump flush: target will discard_regs(), stack must be current
 	switch( op ) {
 	case OJAlways:
 		XJump(JAlways,j);
@@ -2893,6 +2984,7 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 		set_native_arg(ctx, pconst64(&p,(int_val)v->t));
 		break;
 	}
+	flush_vreg(ctx, v); // [OPT step 8] Guard direct &v->stack read: LEA passes stack address to native code
 	tmp = alloc_native_arg(ctx);
 	op64(ctx,MOV,tmp,REG_AT(Ebp));
 	if( v->stackPos >= 0 )
@@ -2939,10 +3031,13 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->t = f->regs[i];
 		r->size = hl_type_size(r->t);
 		r->current = NULL;
+		r->dirty = false; // [OPT step 1] Initialize dirty flag for each vreg at function entry
 		r->stack.holds = NULL;
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
 	}
+	// Extra temporary vreg slot used as R(f->nregs) -- just init dirty flag
+	R(f->nregs)->dirty = false;
 	size = 0;
 	int argsSize = 0;
 	for(i=0;i<nargs;i++) {
@@ -2973,6 +3068,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 	ctx->totalRegsSize = size;
 	jit_buf(ctx);
 	ctx->functionPos = BUF_POS();
+#	ifdef JIT_DEBUG_DIRTY
+	//printf("\n=== JIT f%d nregs=%d nops=%d regsSize=%d ===\n", f->findex, f->nregs, f->nops, size);
+#	endif
 	// make sure currentPos is > 0 before any reg allocations happen
 	// otherwise `alloc_reg` thinks that all registers are locked
 	ctx->currentPos = 1;
@@ -3132,6 +3230,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			{
 				preg *r = dst->t->kind == HBOOL ? alloc_cpu8(ctx, dst, true) : alloc_cpu(ctx, dst, true);
 				op64(ctx, dst->t->kind == HBOOL ? TEST8 : TEST, r, r);
+				flush_all_dirty(ctx); // [OPT step 6b] Direct XJump (not via do_jump) -- flush before branch
 				XJump( o->op == OJFalse || o->op == OJNull ? JZero : JNotZero,jump);
 				register_jump(ctx,jump,(opCount + 1) + o->p2);
 			}
@@ -3451,6 +3550,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				op32(ctx,TEST,tmp,tmp);
 				scratch(tmp);
 				XJump_small(JNotZero,jhasvalue);
+				flush_all_dirty(ctx); // [OPT step 9] Flush before save_regs() so snapshot starts clean
 				save_regs(ctx);
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
 				preg *rr = r;
@@ -3467,21 +3567,25 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					if( o->p3 >= 63 ) jit_error("assert");
 					memcpy(regids + 1, o->extra, o->p3 * sizeof(int));
 					regids[0] = f->nregs;
+					flush_all_dirty(ctx); // [OPT] Flush BEFORE temporary rebind of sc
 					sc->size = HL_WSIZE;
 					sc->t = &hlt_dyn;
 					op64(ctx, MOV, pc, pmem(&p,r->id,HL_WSIZE*3));
 					scratch(pc);
+					sc->dirty = false; // temporary bind should never carry stale dirty state
 					sc->current = pc;
 					pc->holds = sc;
 					size = prepare_call_args(ctx,o->p3 + 1,regids,ctx->vregs,0);
 					if( r->holds != ra ) r = alloc_cpu(ctx, ra, true);
 				}
 #				else
+				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,HL_WSIZE);
 				if( r->holds != ra ) r = alloc_cpu(ctx, ra, true);
 				op64(ctx, PUSH,pmem(&p,r->id,HL_WSIZE*3),UNUSED); // push closure value
 #				endif
 				op_call(ctx, pmem(&p,r->id,HL_WSIZE), size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx,false);
 				patch_jump(ctx,jend);
 				store_result(ctx, dst);
@@ -3537,6 +3641,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						set_native_arg(ctx,v);
 						call_native(ctx,get_dynget(dst->t),size);
 						store_result(ctx,dst);
+						flush_vreg(ctx, dst); // [OPT] Flush before mini-merge: has_field path writes stack directly
 						XJump_small(JAlways,jend);
 						patch_jump(ctx,jhasfield);
 						copy_to(ctx, dst, pmem(&p,(CpuReg)r->id,0));
@@ -3699,8 +3804,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				args[0] = 0;
 				for(i=1;i<nargs;i++)
 					args[i] = o->extra[i-1];
+				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,nargs,args,ctx->vregs,0);
 				op_call(ctx,pmem(&p,tmp->id,o->p2*HL_WSIZE),size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx, false);
 				store_result(ctx, dst);
 			}
@@ -3714,8 +3821,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				tmp = alloc_reg(ctx, RCPU_CALL);
 				op64(ctx,MOV,tmp,pmem(&p,r->id,0)); // read type
 				op64(ctx,MOV,tmp,pmem(&p,tmp->id,HL_WSIZE*2)); // read proto
+				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
 				op_call(ctx,pmem(&p,tmp->id,o->p2*HL_WSIZE),size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx, false);
 				store_result(ctx, dst);
 				break;
@@ -3733,6 +3842,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					preg *r = alloc_reg(ctx,RCPU_CALL);
 					op64(ctx,MOV,r,pmem(&p,v->id,sizeof(vvirtual)+HL_WSIZE*o->p2));
 					op64(ctx,TEST,r,r);
+					flush_all_dirty(ctx); // [OPT step 9] Flush before save_regs() so snapshot starts clean
 					save_regs(ctx);
 
 					if( o->p3 < 6 ) {
@@ -3757,6 +3867,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 							} else
 								obj_in_args = true;
 						} else {
+							flush_vreg(ctx, a); // [OPT step 8] Guard direct &a->stack read in OCallMethod HVIRTUAL
 							preg *r2 = alloc_reg(ctx,RCPU);
 							op64(ctx,LEA,r2,&a->stack);
 							op64(ctx,MOV,pmem(&p,r->id,i*HL_WSIZE),r2);
@@ -3794,6 +3905,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 
 					if( !obj_in_args ) {
 						// o = o->value hack
+						flush_all_dirty(ctx); // [OPT] Flush before call
 						if( v->holds ) v->holds->current = NULL;
 						obj->current = v;
 						v->holds = obj;
@@ -3802,7 +3914,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					} else {
 						// keep o->value in R(f->nregs)
 						int regids[64];
-						preg *pc = alloc_reg(ctx,RCPU_CALL);
+						preg *pc;
+						flush_all_dirty(ctx); // [OPT] Flush before call
+						pc = alloc_reg(ctx,RCPU_CALL);
 						vreg *sc = R(f->nregs); // scratch register that we temporary rebind
 						if( o->p3 >= 63 ) jit_error("assert");
 						memcpy(regids, o->extra, o->p3 * sizeof(int));
@@ -3811,12 +3925,14 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						sc->t = &hlt_dyn;
 						op64(ctx, MOV, pc, pmem(&p,v->id,HL_WSIZE));
 						scratch(pc);
+						sc->dirty = false; // temporary bind should never carry stale dirty state
 						sc->current = pc;
 						pc->holds = sc;
 						size = prepare_call_args(ctx,o->p3,regids,ctx->vregs,0);
 					}
 
 					op_call(ctx,r,size);
+					flush_all_dirty(ctx);
 					discard_regs(ctx, false);
 					store_result(ctx, dst);
 					patch_jump(ctx,jend);
@@ -3840,7 +3956,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			}
 			break;
 		case OLabel:
-			// NOP for now
+			flush_all_dirty(ctx);
 			discard_regs(ctx,false);
 			break;
 		case OGetI8:
@@ -4121,6 +4237,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			{
 				int jz;
 				preg *r = alloc_cpu(ctx,dst,true);
+				flush_all_dirty(ctx); // [OPT] Flush before branch: error path must not be only path that writes stack
 				op64(ctx,TEST,r,r);
 				XJump_small(JNotZero,jz);
 
@@ -4416,6 +4533,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				preg *r = alloc_cpu(ctx, dst, true);
 				preg *r2 = alloc_reg(ctx, RCPU);
 				op32(ctx, CMP, r, pconst(&p,o->p2));
+				flush_all_dirty(ctx); // [OPT step 6b] Direct XJump in OSwitch -- flush before branch
 				XJump(JUGte,jdefault);
 				// r2 = r * 5 + eip
 #				ifdef HL_64
@@ -4519,6 +4637,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					break;
 				case 2: // read vm reg
 					rb--;
+					flush_vreg(ctx, rb); // [OPT step 8] Guard direct &rb->stack read in OAsm case 2
 					copy(ctx, REG_AT(o->p2), &rb->stack, rb->size);
 					scratch(REG_AT(o->p2));
 					break;
@@ -4547,9 +4666,13 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			jit_error(hl_op_name(o->op));
 			break;
 		}
-		// we are landing at this position, assume we have lost our registers
-		if( ctx->opsPos[opCount+1] == -1 )
+		// we are landing at this position, assume we have lost our registers.
+		// Also flush on direct fallthrough into OLabel (merge point): if we only
+		// discard there, dirty write-back values are lost.
+		if( ctx->opsPos[opCount+1] == -1 ) {
+			flush_all_dirty(ctx);
 			discard_regs(ctx,true);
+		}
 		ctx->opsPos[opCount+1] = BUF_POS();
 
 		// write debug infos
