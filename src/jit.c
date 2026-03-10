@@ -1311,13 +1311,13 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
 			ASSERT(0);
-		// DEFERRED: skip copy, flush will write to stack later
+		copy(ctx,&r->stack,v,r->size); // write-through
 		if( r->current != v ) {
 			scratch(v);
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = true;
+		r->dirty = false; // A: change to true to test flush code emission alone
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
