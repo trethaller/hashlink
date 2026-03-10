@@ -953,14 +953,14 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
 // [OPT step 2] Write dirty register value back to its stack slot.
 // Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
 static void flush_vreg( jit_ctx *ctx, vreg *r ) {
-	if( r->dirty && r->current ) {
+	if( r->dirty && r->current && r->size > 0 ) {
 #		ifdef JIT_DEBUG_DIRTY
 		printf("  flush vreg %d (reg %d, size %d) at bufpos %d\n",
 			(int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
 #		endif
-		copy(ctx, &r->stack, r->current, r->size);
-		r->dirty = false;
+		{ int i; for(i=0;i<8;i++) B(0x90); } // TEST: NOPs instead of MOV
 	}
+	r->dirty = false;
 }
 
 static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
@@ -1409,8 +1409,20 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 // [OPT step 6] Flush all dirty scratch+XMM registers to stack.
 // Called before calls (6a), branches (6b), and merge-point fallthroughs (6c).
 // Only iterates scratch registers -- callee-saved are never discarded at merge points.
-static void flush_all_dirty( jit_ctx *ctx ) {
+static void flush_all_dirty_impl( jit_ctx *ctx, const char *tag ) {
 	int i;
+	int any = 0;
+	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
+		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+		if( r->holds && r->holds->dirty && r->holds->size > 0 ) any = 1;
+	}
+	for(i=0;i<RFPU_COUNT;i++) {
+		preg *r = ctx->pregs + XMM(i);
+		if( r->holds && r->holds->dirty && r->holds->size > 0 ) any = 1;
+	}
+#	ifdef JIT_DEBUG_DIRTY
+	if( any ) printf("flush_all(%s) at bufpos %d\n", tag, BUF_POS());
+#	endif
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) flush_vreg(ctx, r->holds);
@@ -1420,6 +1432,9 @@ static void flush_all_dirty( jit_ctx *ctx ) {
 		if( r->holds ) flush_vreg(ctx, r->holds);
 	}
 }
+#define STRINGIFY2(x) #x
+#define STRINGIFY(x) STRINGIFY2(x)
+#define flush_all_dirty(ctx) flush_all_dirty_impl(ctx, "line " STRINGIFY(__LINE__))
 
 static int pad_before_call( jit_ctx *ctx, int size ) {
 	int total = size + ctx->totalRegsSize + HL_WSIZE * 2; // EIP+EBP
