@@ -990,7 +990,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				if( k == RCPU_CALL && is_call_reg(p) ) continue;
 				if( k == RCPU_8BITS && !is_reg8(p) ) continue;
 				if( p->holds ) {
-					p->holds->dirty = false; // TEST: metadata-only clear
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1015,7 +1015,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				preg *p = PXMM((i + off)%count);
 				if( p->lock >= ctx->currentPos ) continue;
 				if( p->holds ) {
-					p->holds->dirty = false; // TEST: metadata-only clear
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1044,7 +1044,7 @@ static preg *fetch( vreg *r ) {
 // Macro captures `ctx` from enclosing scope so all ~58 call sites need zero changes.
 static void scratch_impl( jit_ctx *ctx, preg *r ) {
 	if( r && r->holds ) {
-		r->holds->dirty = false; // TEST: metadata-only clear, no code emission
+		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 		r->holds = NULL;
 		r->lock = 0;
@@ -1056,7 +1056,7 @@ static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 	preg *from = fetch(v);
 	if( from == r || v->size == 0 ) return;
 	if( r->holds ) {
-		r->holds->dirty = false; // TEST: metadata-only clear
+		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 	}
 	if( v->current ) {
@@ -1311,13 +1311,13 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
 			ASSERT(0);
-		copy(ctx,&r->stack,v,r->size); // write-through
+		copy(ctx,&r->stack,v,r->size); // write-through for testing
 		if( r->current != v ) {
 			scratch(v);
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = true; // TEST B: dirty=true but flush_vreg is a no-op (no code emission)
+		r->dirty = true;
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
@@ -3124,8 +3124,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->currentPos = opCount + 1;
 		jit_buf(ctx);
 #		ifdef JIT_DEBUG_DIRTY
-		if( f->findex == 406 )
-			printf("f406 op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
+		if( f->findex == 29 )
+			printf("f29 op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
 				opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
 #		endif
 #		ifdef JIT_DEBUG
@@ -3593,6 +3593,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					if( o->p3 >= 63 ) jit_error("assert");
 					memcpy(regids + 1, o->extra, o->p3 * sizeof(int));
 					regids[0] = f->nregs;
+					flush_all_dirty(ctx); // [OPT] Flush BEFORE temporary rebind of sc
 					sc->size = HL_WSIZE;
 					sc->t = &hlt_dyn;
 					op64(ctx, MOV, pc, pmem(&p,r->id,HL_WSIZE*3));
@@ -3603,6 +3604,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					if( r->holds != ra ) r = alloc_cpu(ctx, ra, true);
 				}
 #				else
+				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,HL_WSIZE);
 				if( r->holds != ra ) r = alloc_cpu(ctx, ra, true);
 				op64(ctx, PUSH,pmem(&p,r->id,HL_WSIZE*3),UNUSED); // push closure value
@@ -3924,6 +3926,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 
 					if( !obj_in_args ) {
 						// o = o->value hack
+						flush_all_dirty(ctx); // [OPT] Flush before call
 						if( v->holds ) v->holds->current = NULL;
 						obj->current = v;
 						v->holds = obj;
@@ -3932,7 +3935,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					} else {
 						// keep o->value in R(f->nregs)
 						int regids[64];
-						preg *pc = alloc_reg(ctx,RCPU_CALL);
+						preg *pc;
+						flush_all_dirty(ctx); // [OPT] Flush before call
+						pc = alloc_reg(ctx,RCPU_CALL);
 						vreg *sc = R(f->nregs); // scratch register that we temporary rebind
 						if( o->p3 >= 63 ) jit_error("assert");
 						memcpy(regids, o->extra, o->p3 * sizeof(int));
