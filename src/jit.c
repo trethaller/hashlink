@@ -1301,7 +1301,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 // [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
 // Binary search this value to find which store causes the crash.
 static int defer_counter = 0;
-#define DEFER_UPTO 340
+#define DEFER_UPTO 999999999
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
@@ -1317,6 +1317,10 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 			v->holds = r;
 		}
 		defer_counter++;
+		if( defer_counter == 340 )
+			printf("STORE #340: vreg %d -> reg %d, f%d op%d bufpos=%d\n",
+				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1,
+				ctx->currentPos - 1, BUF_POS());
 		if( defer_counter <= DEFER_UPTO ) {
 			// Deferred: register is authoritative, stack may be stale
 			r->dirty = true;
@@ -3139,9 +3143,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->currentPos = opCount + 1;
 		jit_buf(ctx);
 #		ifdef JIT_DEBUG_DIRTY
-		if( f->findex == 29 )
-			printf("f29 op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
-				opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
+		if( f->findex == 29 || f->findex == 325 )
+			printf("f%d op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
+				f->findex, opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
 #		endif
 #		ifdef JIT_DEBUG
 		if( opCount == 0 || f->ops[opCount-1].op != OAsm ) {
@@ -3681,6 +3685,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						set_native_arg(ctx,v);
 						call_native(ctx,get_dynget(dst->t),size);
 						store_result(ctx,dst);
+						flush_vreg(ctx, dst); // [OPT] Flush before mini-merge: has_field path writes stack directly
 						XJump_small(JAlways,jend);
 						patch_jump(ctx,jhasfield);
 						copy_to(ctx, dst, pmem(&p,(CpuReg)r->id,0));
