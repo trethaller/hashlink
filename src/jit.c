@@ -1379,15 +1379,17 @@ static void store_const( jit_ctx *ctx, vreg *r, int c ) {
 // Callers must flush_all_dirty() BEFORE this. Debug assertions catch missed flushes.
 // Cannot flush here: after calls registers may be clobbered; at merge points
 // compile-time binding state may not match runtime predecessor path.
+int warnCount = 0;
 static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	int i;
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
-			if( r->holds->dirty ) {
-				printf("WARN: dirty vreg %d lost in discard_regs (reg %d) f%d bufpos=%d\n",
+			if( r->holds->dirty && warnCount < 100) {
+				printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d\n",
 					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
-					ctx->f ? ctx->f->findex : -1, BUF_POS());
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call);
+				warnCount++;
 			}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
@@ -1397,10 +1399,11 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RFPU_COUNT;i++) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
-			if( r->holds->dirty ) {
-				printf("WARN: dirty vreg %d lost in discard_regs (xmm%d) f%d bufpos=%d\n",
+			if( r->holds->dirty && warnCount < 100) {
+				printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d\n",
 					(int)(r->holds - ctx->vregs), i,
-					ctx->f ? ctx->f->findex : -1, BUF_POS());
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call);
+				++warnCount;
 			}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
@@ -1606,8 +1609,7 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 
 static void op_call( jit_ctx *ctx, preg *r, int size ) {
 	preg p;
-	// OPT: Should we call this here ?
-	// flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush: registers may be clobbered by the callee
+	flush_all_dirty(ctx); // Flush after args are loaded but before CALL clobbers scratch regs
 #	ifdef JIT_DEBUG
 	if( IS_64 && size >= 0 ) {
 		int jchk;
@@ -1670,6 +1672,7 @@ static void op_call_fun( jit_ctx *ctx, vreg *dst, int findex, int count, int *ar
 			ctx->calls = j;
 			op_call(ctx,pconst(&p,0), size);
 		}
+		flush_all_dirty(ctx);
 		discard_regs(ctx, false);
 	}
 	if( dst )
@@ -3592,6 +3595,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				op64(ctx, PUSH,pmem(&p,r->id,HL_WSIZE*3),UNUSED); // push closure value
 #				endif
 				op_call(ctx, pmem(&p,r->id,HL_WSIZE), size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx,false);
 				patch_jump(ctx,jend);
 				store_result(ctx, dst);
@@ -3813,6 +3817,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,nargs,args,ctx->vregs,0);
 				op_call(ctx,pmem(&p,tmp->id,o->p2*HL_WSIZE),size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx, false);
 				store_result(ctx, dst);
 			}
@@ -3829,6 +3834,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				flush_all_dirty(ctx); // [OPT] Flush before call
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
 				op_call(ctx,pmem(&p,tmp->id,o->p2*HL_WSIZE),size);
+				flush_all_dirty(ctx);
 				discard_regs(ctx, false);
 				store_result(ctx, dst);
 				break;
@@ -3936,6 +3942,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					}
 
 					op_call(ctx,r,size);
+					flush_all_dirty(ctx);
 					discard_regs(ctx, false);
 					store_result(ctx, dst);
 					patch_jump(ctx,jend);
@@ -3959,7 +3966,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			}
 			break;
 		case OLabel:
-			// NOP for now
+			flush_all_dirty(ctx);
 			discard_regs(ctx,false);
 			break;
 		case OGetI8:
