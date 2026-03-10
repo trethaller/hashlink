@@ -1301,13 +1301,29 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 // [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
 // Binary search this value to find which store causes the crash.
 static int defer_counter = 0;
-#define DEFER_UPTO 0
+// 167 works
+// 168 crash
+#define DEFER_UPTO 168
+ // 165-170
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
 		r->current->holds = NULL;
 		r->current = NULL;
 	}
+	if( bind && (v->kind == RCPU || v->kind == RFPU) && ++defer_counter <= DEFER_UPTO ) {
+		// Deferred path: no copy, register is authoritative
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		if( r->current != v ) {
+			scratch(v);
+			r->current = v;
+			v->holds = r;
+		}
+		r->dirty = true;
+		return;
+	}
+	// Original path: copy first, then bind
 	v = copy(ctx,&r->stack,v,r->size);
 	if( IS_FLOAT(r) != (v->kind == RFPU) )
 		ASSERT(0);
