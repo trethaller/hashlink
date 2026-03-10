@@ -232,10 +232,14 @@ static void flush_all_dirty( jit_ctx *ctx ) {
 
 **6a. Before calls:**
 
-Call it immediately before:
-- `op_call(...)` in `call_native()`
-- `op_call(...)` in the non-native path of `op_call_fun()`
-- any other direct call-emission site that is followed by `discard_regs()`
+**CRITICAL: `flush_all_dirty` must NOT go inside `op_call()`.** By the time `op_call()` runs,
+registers may already be clobbered by call setup code (function pointer in EAX, arguments in
+CALL_REGS). See step 12 for details.
+
+Call it at the top of each call-initiating function, BEFORE any register clobbering:
+- Top of `call_native()`, before `MOV EAX, function_pointer`
+- Top of `call_native_consts()`, before the CALL_REGS loading loop
+- Top of `op_call_fun()`, before `prepare_call_args()`
 
 **6b. Before branch instructions:**
 
@@ -341,6 +345,62 @@ inner `if` decides whether rebinding is needed. `dirty = true` is always set in 
 
 Note: the original `store()` had an assertion `IS_FLOAT(r) != (v->kind == RFPU)`. This check
 should be preserved in the new code for safety during development.
+
+### 11. Flush in `load()` -- missed binding-drop site
+
+`load()` evicts the old vreg from a register at line ~1054: `r->holds->current = NULL`. This drops
+the binding without going through `scratch()` or `discard_regs()`. With the dirty flag, if the old
+vreg was dirty, it becomes orphaned with `current=NULL, dirty=true`. A later `fetch()` on that vreg
+returns the stale stack slot.
+
+The plan originally listed 3 binding-drop patterns (scratch, alloc_reg eviction, discard_regs) but
+missed `load()`. Fix: add `flush_vreg(ctx, r->holds)` before `r->holds->current = NULL` in `load()`.
+
+This is safe from re-entrancy: `flush_vreg` calls `copy(RSTACK, RCPU/RFPU)` which emits a direct
+MOV, never calls `alloc_reg()` or `load()`.
+
+### 12. `flush_all_dirty()` placement for calls -- CRITICAL ordering bug
+
+**Bug found during implementation:** The original plan placed `flush_all_dirty()` inside `op_call()`.
+This is WRONG. `op_call()` runs AFTER registers have already been clobbered by call setup:
+
+- `call_native()` loads the function pointer into EAX via `op64(ctx, MOV, PEAX, ...)` before
+  calling `op_call()`. If EAX held a dirty vreg, the `flush_all_dirty()` inside `op_call()` writes
+  the function pointer (not the vreg value) to the vreg's stack slot. Silent corruption.
+
+- `call_native_consts()` loads CALL_REGS (Ecx, Edx, R8, R9 on Win64) with constant arguments
+  before calling `call_native()`. Same problem: dirty vregs in CALL_REGS get overwritten before
+  the flush.
+
+- `prepare_call_args()` copies argument values into call registers before `op_call()` runs.
+  Although `prepare_call_args` uses `scratch()` on each call register (which flushes), the call
+  registers are written via `copy()` first -- if `copy()` emits a MOV that clobbers the register
+  before `scratch()` runs, the flush in scratch writes the new value to the old vreg's stack slot.
+  However, with `flush_all_dirty()` at the START of `op_call_fun()`, all dirty vregs are clean
+  before `prepare_call_args` runs, making this safe.
+
+**Correct placement:**
+
+| Call site | Where to flush | Why |
+|---|---|---|
+| `call_native()` | Top of function, before `MOV EAX, ...` | EAX clobber |
+| `call_native_consts()` | Before the CALL_REGS loading loop | CALL_REGS clobber |
+| `op_call_fun()` | Top of function, before `prepare_call_args()` | Covers both native and non-native paths |
+
+`flush_all_dirty()` must NOT be inside `op_call()` -- remove it from there entirely.
+
+### 13. `ASSERT` macro is unconditional
+
+The `ASSERT(i)` macro in jit.c is NOT `assert(x)`. It is:
+```c
+#define ASSERT(i) { printf("JIT ERROR %d (jit.c line %d)\n",i,(int)__LINE__); jit_exit(); }
+```
+
+It fires UNCONDITIONALLY and prints `i` as the error code. So `ASSERT(!r->dirty)` always crashes
+and prints `0` (the value of `!false`). Debug assertions must be written as:
+```c
+if( r->dirty ) ASSERT(0);
+```
 
 ---
 
@@ -491,7 +551,7 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
             if( r->holds->dirty )
                 printf("BUG: dirty vreg %d discarded without flush (reg %d)\n",
                     (int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i]);
-            ASSERT(!r->holds->dirty);
+            if( r->holds->dirty ) ASSERT(0);
 #           endif
             r->holds->current = NULL;
             r->holds = NULL;
@@ -504,7 +564,7 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
             if( r->holds->dirty )
                 printf("BUG: dirty vreg %d discarded without flush (xmm%d)\n",
                     (int)(r->holds - ctx->vregs), i);
-            ASSERT(!r->holds->dirty);
+            if( r->holds->dirty ) ASSERT(0);
 #           endif
             r->holds->current = NULL;
             r->holds = NULL;
@@ -527,7 +587,7 @@ static preg *fetch( vreg *r ) {
     if( r->current )
         return r->current;
 #   ifdef JIT_DEBUG_DIRTY
-    ASSERT(!r->dirty);  // if unbound, stack must be current
+    if( r->dirty ) ASSERT(0);  // if unbound, stack must be current
 #   endif
     return &r->stack;
 }
@@ -547,7 +607,8 @@ something went wrong (binding was dropped without clearing the flag).
 | Rename `scratch` + macro | `scratch()` definition | 0 |
 | Keep `discard_regs()` pure | No code emission inside function | 0 |
 | Add flush in `alloc_reg()` eviction | 2 sites in `alloc_reg()` | 0 |
-| Add `flush_all_dirty()` before calls | `call_native()` / `op_call_fun()` / similar | ~2-4 one-liners |
+| Add flush in `load()` eviction | 1 site in `load()` | 1 one-liner |
+| Add `flush_all_dirty()` before calls | `call_native()` / `call_native_consts()` / `op_call_fun()` | 3 one-liners |
 | Add `flush_all_dirty()` before jumps | `do_jump()` + 2 direct `XJump` sites | 3 one-liners |
 | Add `flush_all_dirty()` at merge fallthrough | line ~4552 + `OLabel` | 2-3 one-liners |
 | Fix `OAsm` case 3 ordering | 1 line swap | 1 |
