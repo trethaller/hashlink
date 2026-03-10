@@ -3127,11 +3127,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		vreg *rb = R(o->p3);
 		ctx->currentPos = opCount + 1;
 		jit_buf(ctx);
-#		ifdef JIT_DEBUG_DIRTY
-		if( f->findex == 29 || f->findex == 325 )
-			printf("f%d op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
-				f->findex, opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
-#		endif
+
+
+
 #		ifdef JIT_DEBUG
 		if( opCount == 0 || f->ops[opCount-1].op != OAsm ) {
 			int uid = opCount + (f->findex<<16);
@@ -4266,6 +4264,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			{
 				int jz;
 				preg *r = alloc_cpu(ctx,dst,true);
+				flush_all_dirty(ctx); // [OPT] Flush before branch: error path must not be only path that writes stack
 				op64(ctx,TEST,r,r);
 				XJump_small(JNotZero,jz);
 
@@ -4698,7 +4697,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		// Also flush on direct fallthrough into OLabel (merge point): if we only
 		// discard there, dirty write-back values are lost.
 		if( ctx->opsPos[opCount+1] == -1 ) {
-			flush_all_dirty(ctx);  // This fixes the warning at defer 99 apparently ?
+			flush_all_dirty(ctx);
 			discard_regs(ctx,true);
 		}
 		ctx->opsPos[opCount+1] = BUF_POS();
@@ -4725,6 +4724,14 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->jumps = NULL;
 	}
 	int codeEndPos = BUF_POS();
+	if( f->findex == 24 ) {
+		printf("f24 code dump (%d bytes, from %d to %d):\n", codeEndPos - codePos, codePos, codeEndPos);
+		for(i = codePos; i < codeEndPos; i++) {
+			printf("%02x ", (unsigned char)ctx->startBuf[i]);
+			if( (i - codePos) % 32 == 31 ) printf("\n");
+		}
+		printf("\n");
+	}
 	// add nops padding
 	jit_nops(ctx);
 	// clear regs
