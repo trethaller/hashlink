@@ -1816,6 +1816,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			if( pa->kind != RCPU ) {
 				pa = alloc_reg(ctx, RCPU);
 				op(ctx,MOV,pa,fetch(a), is64);
+			} else {
+				scratch(pa); // [OPT fix] Flush a's original value before shift mutates the register
 			}
 			op(ctx,bop == OShl ? SHL : (bop == OUShr ? SHR : SAR), pa, UNUSED,is64);
 			if( dst ) store(ctx, dst, pa, true);
