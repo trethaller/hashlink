@@ -1303,8 +1303,9 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 static int defer_counter = 0;
 // 167 works
 // 168 crash
-#define DEFER_UPTO 168
- // 165-170
+// 95 no warning
+// 99 warning
+#define DEFER_UPTO 99
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
@@ -1321,6 +1322,9 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 			v->holds = r;
 		}
 		r->dirty = true;
+		if( defer_counter == 168 )
+			printf("DEFER #168: vreg %d -> reg %d, f%d op%d bufpos=%d\n",
+				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS());
 		return;
 	}
 	// Original path: copy first, then bind
@@ -1651,6 +1655,7 @@ static void call_native( jit_ctx *ctx, void *nativeFun, int size ) {
 	preg p;
 	// native function, already resolved
 	flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush BEFORE clobbering EAX with function pointer
+	scratch(PEAX);
 	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)nativeFun));
 	op_call(ctx,PEAX, isExc ? -1 : size);
 	if( isExc )
