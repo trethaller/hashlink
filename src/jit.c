@@ -954,15 +954,8 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
 // Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
 static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 	if( r->dirty && r->current && r->size > 0 ) {
-#		ifdef JIT_DEBUG_DIRTY
-		printf("  flush vreg %d (reg %d, size %d) at bufpos %d\n",
-			(int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
-#		endif
 		copy(ctx, &r->stack, r->current, r->size);
 	}
-	if( r->dirty && ctx->f && ctx->f->findex == 29 )
-		printf("  clean: vreg %d (was reg %d) at bufpos %d\n",
-			(int)(r - ctx->vregs), r->current ? r->current->id : -1, BUF_POS());
 	r->dirty = false;
 }
 
@@ -1305,7 +1298,11 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	return NULL;
 }
 
-// [OPT step 10] TEST PHASE: write-through + dirty flag to test flush infrastructure.
+// [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
+// Binary search this value to find which store causes the crash.
+static int defer_counter = 0;
+#define DEFER_UPTO 340
+
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
 		r->current->holds = NULL;
@@ -1314,18 +1311,20 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
 			ASSERT(0);
-		// [OPT] Write-back: no copy, register is authoritative
 		if( r->current != v ) {
 			scratch(v);
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = true;
-#		ifdef JIT_DEBUG_DIRTY
-		if( ctx->f && ctx->f->findex == 29 )
-			printf("  dirty: vreg %d -> reg %d (size %d) bufpos=%d\n",
-				(int)(r - ctx->vregs), v->id, r->size, BUF_POS());
-#		endif
+		defer_counter++;
+		if( defer_counter <= DEFER_UPTO ) {
+			// Deferred: register is authoritative, stack may be stale
+			r->dirty = true;
+		} else {
+			// Write-through fallback: copy to stack immediately
+			copy(ctx,&r->stack,v,r->size);
+			r->dirty = false;
+		}
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
@@ -1427,20 +1426,8 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 // [OPT step 6] Flush all dirty scratch+XMM registers to stack.
 // Called before calls (6a), branches (6b), and merge-point fallthroughs (6c).
 // Only iterates scratch registers -- callee-saved are never discarded at merge points.
-static void flush_all_dirty_impl( jit_ctx *ctx, const char *tag ) {
+static void flush_all_dirty( jit_ctx *ctx ) {
 	int i;
-	int any = 0;
-	for(i=0;i<RCPU_COUNT;i++) {
-		preg *r = ctx->pregs + i;
-		if( r->holds && r->holds->dirty && r->holds->size > 0 ) any = 1;
-	}
-	for(i=0;i<RFPU_COUNT;i++) {
-		preg *r = ctx->pregs + XMM(i);
-		if( r->holds && r->holds->dirty && r->holds->size > 0 ) any = 1;
-	}
-#	ifdef JIT_DEBUG_DIRTY
-	if( any ) printf("flush_all(%s) at bufpos %d\n", tag, BUF_POS());
-#	endif
 	for(i=0;i<RCPU_COUNT;i++) {
 		preg *r = ctx->pregs + i;
 		if( r->holds ) flush_vreg(ctx, r->holds);
@@ -1450,9 +1437,6 @@ static void flush_all_dirty_impl( jit_ctx *ctx, const char *tag ) {
 		if( r->holds ) flush_vreg(ctx, r->holds);
 	}
 }
-#define STRINGIFY2(x) #x
-#define STRINGIFY(x) STRINGIFY2(x)
-#define flush_all_dirty(ctx) flush_all_dirty_impl(ctx, "line " STRINGIFY(__LINE__))
 
 static int pad_before_call( jit_ctx *ctx, int size ) {
 	int total = size + ctx->totalRegsSize + HL_WSIZE * 2; // EIP+EBP
