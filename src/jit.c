@@ -958,8 +958,7 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 		printf("  flush vreg %d (reg %d, size %d) at bufpos %d\n",
 			(int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
 #		endif
-		if( r->size > 1 )
-			copy(ctx, &r->stack, r->current, r->size);
+		copy(ctx, &r->stack, r->current, r->size);
 		r->dirty = false;
 	}
 }
@@ -991,7 +990,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				if( k == RCPU_CALL && is_call_reg(p) ) continue;
 				if( k == RCPU_8BITS && !is_reg8(p) ) continue;
 				if( p->holds ) {
-					flush_vreg(ctx, p->holds); // [OPT step 5] Flush dirty vreg before evicting its CPU register
+					p->holds->dirty = false; // TEST: metadata-only clear
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1016,7 +1015,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				preg *p = PXMM((i + off)%count);
 				if( p->lock >= ctx->currentPos ) continue;
 				if( p->holds ) {
-					flush_vreg(ctx, p->holds); // [OPT step 5] Flush dirty vreg before evicting its FPU register
+					p->holds->dirty = false; // TEST: metadata-only clear
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1045,7 +1044,7 @@ static preg *fetch( vreg *r ) {
 // Macro captures `ctx` from enclosing scope so all ~58 call sites need zero changes.
 static void scratch_impl( jit_ctx *ctx, preg *r ) {
 	if( r && r->holds ) {
-		flush_vreg(ctx, r->holds);
+		r->holds->dirty = false; // TEST: metadata-only clear, no code emission
 		r->holds->current = NULL;
 		r->holds = NULL;
 		r->lock = 0;
@@ -1057,7 +1056,7 @@ static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 	preg *from = fetch(v);
 	if( from == r || v->size == 0 ) return;
 	if( r->holds ) {
-		flush_vreg(ctx, r->holds);  // Is this needed? 
+		r->holds->dirty = false; // TEST: metadata-only clear
 		r->holds->current = NULL;
 	}
 	if( v->current ) {
