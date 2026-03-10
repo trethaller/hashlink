@@ -1922,8 +1922,11 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			op32(ctx, o, pa, pb);
+			// [OPT fix] Detach pa from source vreg BEFORE mutation, so flush writes the
+			// original (unmutated) value. Without this, scratch after op32 would write the
+			// arithmetic result back to the source vreg's stack slot, corrupting it.
 			scratch(pa);
+			op32(ctx, o, pa, pb);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -1964,8 +1967,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
+			scratch(pa); // [OPT fix] Flush original value before mutating register
 			op64(ctx, o, pa, pb);
-			scratch(pa);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -1994,6 +1997,9 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		pb = alloc_fpu(ctx, b, true);
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RFPU,RFPU):
+			// [OPT fix] Flush original value before mutation (ADDSD/MULSD/etc mutate pa;
+			// COMISD/COMISS only set flags so scratch is harmless for those).
+			scratch(pa);
 			op64(ctx,o,pa,pb);
 			if( (o == COMISD || o == COMISS) && bop != OJSGt ) {
 				int jnotnan;
@@ -2031,7 +2037,6 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 				}
 				patch_jump(ctx,jnotnan);
 			}
-			scratch(pa);
 			out = pa;
 			break;
 		default:
@@ -2922,6 +2927,7 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 		case HI64:
 		case HGUID:
 			tmp = alloc_cpu(ctx, v, true);
+			scratch(tmp); // [OPT fix] Flush v's original value before mutating register
 			op64(ctx, TEST, tmp, tmp);
 			XJump_small(JZero, jnull);
 			op64(ctx, MOV, tmp, pmem(&p,tmp->id,8));
@@ -3192,6 +3198,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		case ONot:
 			{
 				preg *v = alloc_cpu(ctx,ra,true);
+				scratch(v); // [OPT fix] Flush ra's original value before mutating register
 				op32(ctx,XOR,v,pconst(&p,1));
 				store(ctx,dst,v,true);
 			}
