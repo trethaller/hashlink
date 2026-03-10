@@ -1301,7 +1301,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 // [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
 // Binary search this value to find which store causes the crash.
 static int defer_counter = 0;
-#define DEFER_UPTO 999999999
+#define DEFER_UPTO 0
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
@@ -1640,7 +1640,7 @@ static void op_call( jit_ctx *ctx, preg *r, int size ) {
 		op64(ctx,SUB,PESP,pconst(&p,32));
 		if( size >= 0 ) size += 32;
 	}
-	// NOTE: do NOT flush here — registers may already be clobbered by prepare_call_args.
+	// NOTE: do NOT flush here registers may already be clobbered by prepare_call_args.
 	// Callers (call_native, op_call_fun, etc.) must flush BEFORE loading args/function pointer.
 	op32(ctx, CALL, r, UNUSED);
 	if( size > 0 ) op64(ctx,ADD,PESP,pconst(&p,size));
