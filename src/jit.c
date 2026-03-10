@@ -953,7 +953,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
 // [OPT step 2] Write dirty register value back to its stack slot.
 // Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
 static int flush_counter = 0;
-#define FLUSH_UPTO 216  // real copy for flush 0..N-1, NOPs for N+
+#define FLUSH_UPTO 99900  // real copy for flush 0..N-1, NOPs for N+
 static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 	if( r->dirty && r->current && r->size > 0 ) {
 		int n = flush_counter++;
@@ -3133,8 +3133,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->currentPos = opCount + 1;
 		jit_buf(ctx);
 #		ifdef JIT_DEBUG_DIRTY
-		// printf("f%d op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
-		// 	f->findex, opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
+		if( f->findex == 406 )
+			printf("f406 op%d %s p1=%d p2=%d p3=%d bufpos=%d\n",
+				opCount, hl_op_name(o->op), o->p1, o->p2, o->p3, BUF_POS());
 #		endif
 #		ifdef JIT_DEBUG
 		if( opCount == 0 || f->ops[opCount-1].op != OAsm ) {
@@ -3978,8 +3979,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			}
 			break;
 		case OLabel:
-			// NOP for now
-			flush_all_dirty(ctx); // [OPT step 6c] Flush before fallthrough into merge point (OLabel)
+			// NO flush here. OLabel is a merge point: execution can arrive from a jump where
+			// registers hold completely different values than the fallthrough path.
+			// Flushing here would emit a MOV that writes the wrong register value on the jump path.
+			// Instead, all jump sources (do_jump, OJTrue/OJFalse/OJNull, OSwitch) must flush before jumping.
 			discard_regs(ctx,false);
 			break;
 		case OGetI8:
