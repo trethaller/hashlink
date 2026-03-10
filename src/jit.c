@@ -219,7 +219,7 @@ struct vreg {
 	hl_type *t;
 	preg *current;
 	preg stack;
-	bool dirty; // [OPT step 1] Write-back dirty flag: true when register holds a newer value than the stack slot
+	int dirty; // [OPT step 1] Write-back dirty flag: nonzero=defer_counter that set it, 0=clean
 };
 
 #define REG_AT(i)		(ctx->pregs + (i))
@@ -1301,11 +1301,9 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 // [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
 // Binary search this value to find which store causes the crash.
 static int defer_counter = 0;
-// 167 works
-// 168 crash
-// 95 no warning
-// 99 warning
-#define DEFER_UPTO 99
+// 105 works, 106 crashes
+#define DEFER_UPTO 106
+
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
@@ -1321,8 +1319,8 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = true;
-		if( defer_counter == 168 )
+		r->dirty = defer_counter;
+		if( defer_counter == 0)  // REMOVE
 			printf("DEFER #168: vreg %d -> reg %d, f%d op%d bufpos=%d\n",
 				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS());
 		return;
@@ -1406,9 +1404,9 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
 			if( r->holds->dirty && warnCount < 100) {
-				printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d\n",
+				printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d defer#%d\n",
 					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
-					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call);
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
 				warnCount++;
 			}
 			r->holds->dirty = false;
@@ -1420,9 +1418,9 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
 			if( r->holds->dirty && warnCount < 100) {
-				printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d\n",
+				printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d defer#%d\n",
 					(int)(r->holds - ctx->vregs), i,
-					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call);
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
 				++warnCount;
 			}
 			r->holds->dirty = false;
@@ -4699,8 +4697,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		// We are landing at this position, assume we have lost our registers.
 		// Also flush on direct fallthrough into OLabel (merge point): if we only
 		// discard there, dirty write-back values are lost.
-		if( ctx->opsPos[opCount+1] == -1 )
+		if( ctx->opsPos[opCount+1] == -1 ) {
+			flush_all_dirty(ctx);  // This fixes the warning at defer 99 apparently ?
 			discard_regs(ctx,true);
+		}
 		ctx->opsPos[opCount+1] = BUF_POS();
 
 		// write debug infos
