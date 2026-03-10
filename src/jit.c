@@ -1302,23 +1302,28 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	return NULL;
 }
 
-// [OPT step 10] Store with write-through (baseline). All infrastructure in place for write-back.
-// To enable deferred writes: skip the copy() call in the bind path and set dirty=true.
+// [OPT step 10] TEST PHASE: write-through + dirty flag to test flush infrastructure.
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( r->current && r->current != v ) {
 		r->current->holds = NULL;
 		r->current = NULL;
 	}
-	// Always write to stack (original behavior)
-	v = copy(ctx,&r->stack,v,r->size);
-	if( IS_FLOAT(r) != (v->kind == RFPU) )
-		ASSERT(0);
-	if( bind && r->current != v && (v->kind == RCPU || v->kind == RFPU) ) {
-		scratch(v);
-		r->current = v;
-		v->holds = r;
+	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		copy(ctx,&r->stack,v,r->size); // write-through (safety)
+		if( r->current != v ) {
+			scratch(v);
+			r->current = v;
+			v->holds = r;
+		}
+		r->dirty = true; // TEST: write-through + dirty (tests flush infra without safety-net in op_call)
+	} else {
+		v = copy(ctx,&r->stack,v,r->size);
+		if( IS_FLOAT(r) != (v->kind == RFPU) )
+			ASSERT(0);
+		r->dirty = false;
 	}
-	r->dirty = false;
 }
 
 static void store_result( jit_ctx *ctx, vreg *r ) {
@@ -1614,7 +1619,8 @@ static void op_call( jit_ctx *ctx, preg *r, int size ) {
 		op64(ctx,SUB,PESP,pconst(&p,32));
 		if( size >= 0 ) size += 32;
 	}
-	flush_all_dirty(ctx); // safety net: catch any dirty regs right before CALL
+	// NOTE: do NOT flush here — registers may already be clobbered by prepare_call_args.
+	// Callers (call_native, op_call_fun, etc.) must flush BEFORE loading args/function pointer.
 	op32(ctx, CALL, r, UNUSED);
 	if( size > 0 ) op64(ctx,ADD,PESP,pconst(&p,size));
 }
