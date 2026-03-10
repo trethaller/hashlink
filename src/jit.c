@@ -952,22 +952,13 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
 
 // [OPT step 2] Write dirty register value back to its stack slot.
 // Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
-static int flush_counter = 0;
-#define FLUSH_UPTO 99900  // real copy for flush 0..N-1, NOPs for N+
 static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 	if( r->dirty && r->current && r->size > 0 ) {
-		int n = flush_counter++;
 #		ifdef JIT_DEBUG_DIRTY
-		printf("  flush #%d vreg %d (reg %d, size %d) at bufpos %d\n",
-		 	n, (int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
+		printf("  flush vreg %d (reg %d, size %d) at bufpos %d\n",
+			(int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
 #		endif
-		if( n == 215 )
-			printf("  >>> GUILTY flush #215: vreg %d reg %d size %d stackPos %d bufpos %d\n",
-				(int)(r - ctx->vregs), r->current->id, r->size, r->stackPos, BUF_POS());
-		if( n < FLUSH_UPTO )
-			copy(ctx, &r->stack, r->current, r->size);
-		else
-			{ int i; for(i=0;i<8;i++) B(0x90); }
+		copy(ctx, &r->stack, r->current, r->size);
 	}
 	r->dirty = false;
 }
