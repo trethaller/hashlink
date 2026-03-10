@@ -958,7 +958,8 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 		printf("  flush vreg %d (reg %d, size %d) at bufpos %d\n",
 			(int)(r - ctx->vregs), r->current->id, r->size, BUF_POS());
 #		endif
-		copy(ctx, &r->stack, r->current, r->size);
+		// TEST: skip the actual copy to isolate whether code emission causes the crash
+		// copy(ctx, &r->stack, r->current, r->size);
 		r->dirty = false;
 	}
 }
@@ -1317,7 +1318,7 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = false; // A: change to true to test flush code emission alone
+		r->dirty = true; // TEST B: dirty=true but flush_vreg is a no-op (no code emission)
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
