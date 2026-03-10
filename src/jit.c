@@ -1301,8 +1301,8 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 // [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
 // Binary search this value to find which store causes the crash.
 static int defer_counter = 0;
-// 105 works, 106 crashes
-#define DEFER_UPTO 106
+// 926 works, 927 crashes
+#define DEFER_UPTO 927
 
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
