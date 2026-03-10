@@ -1311,13 +1311,13 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
 			ASSERT(0);
-		copy(ctx,&r->stack,v,r->size); // write-through (safety)
+		// DEFERRED: skip copy, flush will write to stack later
 		if( r->current != v ) {
 			scratch(v);
 			r->current = v;
 			v->holds = r;
 		}
-		r->dirty = true; // TEST: write-through + dirty (tests flush infra without safety-net in op_call)
+		r->dirty = true;
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
