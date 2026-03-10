@@ -1308,33 +1308,15 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 		r->current->holds = NULL;
 		r->current = NULL;
 	}
-	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
-		if( IS_FLOAT(r) != (v->kind == RFPU) )
-			ASSERT(0);
-		if( r->current != v ) {
-			scratch(v);
-			r->current = v;
-			v->holds = r;
-		}
-		defer_counter++;
-		if( defer_counter == 340 )
-			printf("STORE #340: vreg %d -> reg %d, f%d op%d bufpos=%d\n",
-				(int)(r - ctx->vregs), v->id, ctx->f ? ctx->f->findex : -1,
-				ctx->currentPos - 1, BUF_POS());
-		if( defer_counter <= DEFER_UPTO ) {
-			// Deferred: register is authoritative, stack may be stale
-			r->dirty = true;
-		} else {
-			// Write-through fallback: copy to stack immediately
-			copy(ctx,&r->stack,v,r->size);
-			r->dirty = false;
-		}
-	} else {
-		v = copy(ctx,&r->stack,v,r->size);
-		if( IS_FLOAT(r) != (v->kind == RFPU) )
-			ASSERT(0);
-		r->dirty = false;
+	v = copy(ctx,&r->stack,v,r->size);
+	if( IS_FLOAT(r) != (v->kind == RFPU) )
+		ASSERT(0);
+	if( bind && r->current != v && (v->kind == RCPU || v->kind == RFPU) ) {
+		scratch(v);
+		r->current = v;
+		v->holds = r;
 	}
+	r->dirty = false;
 }
 
 static void store_result( jit_ctx *ctx, vreg *r ) {
@@ -1857,8 +1839,6 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			if( pa->kind != RCPU ) {
 				pa = alloc_reg(ctx, RCPU);
 				op(ctx,MOV,pa,fetch(a), is64);
-			} else {
-				scratch(pa); // [OPT fix] Flush a's original value before shift mutates the register
 			}
 			op(ctx,bop == OShl ? SHL : (bop == OUShr ? SHR : SAR), pa, UNUSED,is64);
 			if( dst ) store(ctx, dst, pa, true);
@@ -1965,11 +1945,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			// [OPT fix] Detach pa from source vreg BEFORE mutation, so flush writes the
-			// original (unmutated) value. Without this, scratch after op32 would write the
-			// arithmetic result back to the source vreg's stack slot, corrupting it.
-			scratch(pa);
 			op32(ctx, o, pa, pb);
+			scratch(pa);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -2010,8 +1987,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			scratch(pa); // [OPT fix] Flush original value before mutating register
 			op64(ctx, o, pa, pb);
+			scratch(pa);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -2040,9 +2017,6 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		pb = alloc_fpu(ctx, b, true);
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RFPU,RFPU):
-			// [OPT fix] Flush original value before mutation (ADDSD/MULSD/etc mutate pa;
-			// COMISD/COMISS only set flags so scratch is harmless for those).
-			scratch(pa);
 			op64(ctx,o,pa,pb);
 			if( (o == COMISD || o == COMISS) && bop != OJSGt ) {
 				int jnotnan;
@@ -2080,6 +2054,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 				}
 				patch_jump(ctx,jnotnan);
 			}
+			scratch(pa);
 			out = pa;
 			break;
 		default:
@@ -2970,7 +2945,6 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 		case HI64:
 		case HGUID:
 			tmp = alloc_cpu(ctx, v, true);
-			scratch(tmp); // [OPT fix] Flush v's original value before mutating register
 			op64(ctx, TEST, tmp, tmp);
 			XJump_small(JZero, jnull);
 			op64(ctx, MOV, tmp, pmem(&p,tmp->id,8));
@@ -3063,19 +3037,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
 	}
-	// Extra temporary vreg slot used as R(f->nregs) in some call paths.
-	// It is not a real VM register and has no dedicated stack slot, so keep it clean.
-	{
-		vreg *r = R(f->nregs);
-		r->t = &hlt_dyn;
-		r->size = 0;
-		r->current = NULL;
-		r->dirty = false;
-		r->stack.holds = NULL;
-		r->stack.id = f->nregs;
-		r->stack.kind = RSTACK;
-		r->stackPos = 0;
-	}
+	// Extra temporary vreg slot used as R(f->nregs) -- just init dirty flag
+	R(f->nregs)->dirty = false;
 	size = 0;
 	int argsSize = 0;
 	for(i=0;i<nargs;i++) {
@@ -3263,7 +3226,6 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		case ONot:
 			{
 				preg *v = alloc_cpu(ctx,ra,true);
-				scratch(v); // [OPT fix] Flush ra's original value before mutating register
 				op32(ctx,XOR,v,pconst(&p,1));
 				store(ctx,dst,v,true);
 			}
@@ -3997,10 +3959,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			}
 			break;
 		case OLabel:
-			// NO flush here. OLabel is a merge point: execution can arrive from a jump where
-			// registers hold completely different values than the fallthrough path.
-			// Flushing here would emit a MOV that writes the wrong register value on the jump path.
-			// Instead, all jump sources (do_jump, OJTrue/OJFalse/OJNull, OSwitch) must flush before jumping.
+			// NOP for now
 			discard_regs(ctx,false);
 			break;
 		case OGetI8:
@@ -4686,10 +4645,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					break;
 				case 3: // write vm reg
 					rb--;
-					// [OPT step 7] Swapped: scratch (flush old) BEFORE copy (write new).
-					// Original order was copy-then-scratch, which clobbered the new value.
-					scratch(rb->current);
 					copy(ctx, &rb->stack, REG_AT(o->p2), rb->size);
+					scratch(rb->current);
 					break;
 				case 4:
 					if( ctx->totalRegsSize != 0 )
@@ -4714,10 +4671,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		// We are landing at this position, assume we have lost our registers.
 		// Also flush on direct fallthrough into OLabel (merge point): if we only
 		// discard there, dirty write-back values are lost.
-		if( ctx->opsPos[opCount+1] == -1 || ((opCount + 1) < f->nops && f->ops[opCount + 1].op == OLabel) ) {
-			flush_all_dirty(ctx); // [OPT step 6c] Flush before fallthrough into merge point (end of opcode loop)
+		if( ctx->opsPos[opCount+1] == -1 )
 			discard_regs(ctx,true);
-		}
 		ctx->opsPos[opCount+1] = BUF_POS();
 
 		// write debug infos
