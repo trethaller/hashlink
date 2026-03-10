@@ -960,6 +960,9 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 #		endif
 		copy(ctx, &r->stack, r->current, r->size);
 	}
+	if( r->dirty && ctx->f && ctx->f->findex == 29 )
+		printf("  clean: vreg %d (was reg %d) at bufpos %d\n",
+			(int)(r - ctx->vregs), r->current ? r->current->id : -1, BUF_POS());
 	r->dirty = false;
 }
 
@@ -1311,13 +1314,18 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 	if( bind && (v->kind == RCPU || v->kind == RFPU) ) {
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
 			ASSERT(0);
-		copy(ctx,&r->stack,v,r->size); // write-through for testing
+		// [OPT] Write-back: no copy, register is authoritative
 		if( r->current != v ) {
 			scratch(v);
 			r->current = v;
 			v->holds = r;
 		}
 		r->dirty = true;
+#		ifdef JIT_DEBUG_DIRTY
+		if( ctx->f && ctx->f->findex == 29 )
+			printf("  dirty: vreg %d -> reg %d (size %d) bufpos=%d\n",
+				(int)(r - ctx->vregs), v->id, r->size, BUF_POS());
+#		endif
 	} else {
 		v = copy(ctx,&r->stack,v,r->size);
 		if( IS_FLOAT(r) != (v->kind == RFPU) )
@@ -1391,6 +1399,11 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
+			if( r->holds->dirty ) {
+				printf("WARN: dirty vreg %d lost in discard_regs (reg %d) f%d bufpos=%d\n",
+					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
+					ctx->f ? ctx->f->findex : -1, BUF_POS());
+			}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
@@ -1399,6 +1412,11 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RFPU_COUNT;i++) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
+			if( r->holds->dirty ) {
+				printf("WARN: dirty vreg %d lost in discard_regs (xmm%d) f%d bufpos=%d\n",
+					(int)(r->holds - ctx->vregs), i,
+					ctx->f ? ctx->f->findex : -1, BUF_POS());
+			}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
@@ -1412,8 +1430,8 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 static void flush_all_dirty_impl( jit_ctx *ctx, const char *tag ) {
 	int i;
 	int any = 0;
-	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
-		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+	for(i=0;i<RCPU_COUNT;i++) {
+		preg *r = ctx->pregs + i;
 		if( r->holds && r->holds->dirty && r->holds->size > 0 ) any = 1;
 	}
 	for(i=0;i<RFPU_COUNT;i++) {
@@ -1423,8 +1441,8 @@ static void flush_all_dirty_impl( jit_ctx *ctx, const char *tag ) {
 #	ifdef JIT_DEBUG_DIRTY
 	if( any ) printf("flush_all(%s) at bufpos %d\n", tag, BUF_POS());
 #	endif
-	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
-		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+	for(i=0;i<RCPU_COUNT;i++) {
+		preg *r = ctx->pregs + i;
 		if( r->holds ) flush_vreg(ctx, r->holds);
 	}
 	for(i=0;i<RFPU_COUNT;i++) {
@@ -1618,7 +1636,7 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 
 static void op_call( jit_ctx *ctx, preg *r, int size ) {
 	preg p;
-	// Should we call this here ?
+	// OPT: Should we call this here ?
 	// flush_all_dirty(ctx); // [OPT step 6a] Pre-call flush: registers may be clobbered by the callee
 #	ifdef JIT_DEBUG
 	if( IS_64 && size >= 0 ) {
@@ -3057,6 +3075,19 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
 	}
+	// Extra temporary vreg slot used as R(f->nregs) in some call paths.
+	// It is not a real VM register and has no dedicated stack slot, so keep it clean.
+	{
+		vreg *r = R(f->nregs);
+		r->t = &hlt_dyn;
+		r->size = 0;
+		r->current = NULL;
+		r->dirty = false;
+		r->stack.holds = NULL;
+		r->stack.id = f->nregs;
+		r->stack.kind = RSTACK;
+		r->stackPos = 0;
+	}
 	size = 0;
 	int argsSize = 0;
 	for(i=0;i<nargs;i++) {
@@ -3598,6 +3629,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					sc->t = &hlt_dyn;
 					op64(ctx, MOV, pc, pmem(&p,r->id,HL_WSIZE*3));
 					scratch(pc);
+					sc->dirty = false; // temporary bind should never carry stale dirty state
 					sc->current = pc;
 					pc->holds = sc;
 					size = prepare_call_args(ctx,o->p3 + 1,regids,ctx->vregs,0);
@@ -3946,6 +3978,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						sc->t = &hlt_dyn;
 						op64(ctx, MOV, pc, pmem(&p,v->id,HL_WSIZE));
 						scratch(pc);
+						sc->dirty = false; // temporary bind should never carry stale dirty state
 						sc->current = pc;
 						pc->holds = sc;
 						size = prepare_call_args(ctx,o->p3,regids,ctx->vregs,0);
@@ -4689,8 +4722,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			jit_error(hl_op_name(o->op));
 			break;
 		}
-		// we are landing at this position, assume we have lost our registers
-		if( ctx->opsPos[opCount+1] == -1 ) {
+		// We are landing at this position, assume we have lost our registers.
+		// Also flush on direct fallthrough into OLabel (merge point): if we only
+		// discard there, dirty write-back values are lost.
+		if( ctx->opsPos[opCount+1] == -1 || ((opCount + 1) < f->nops && f->ops[opCount + 1].op == OLabel) ) {
 			flush_all_dirty(ctx); // [OPT step 6c] Flush before fallthrough into merge point (end of opcode loop)
 			discard_regs(ctx,true);
 		}
