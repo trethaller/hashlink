@@ -32,7 +32,16 @@
 
 #ifdef HL_DEBUG
 #	define JIT_DEBUG
+#	define JIT_DEBUG_DIRTY
 #endif
+
+// [OPT BISECT] Deferred stores up to DEFER_UPTO are truly deferred; beyond that, write-through.
+// Binary search this value to find which store causes the crash.
+// error in 75k - 77k
+static int defer_counter = 0;
+#define DEFER_MIN 0
+#define DEFER_MAX 75000
+static int DEBUG_FUNC = 0;
 
 typedef enum {
 	Eax = 0,
@@ -218,6 +227,7 @@ struct vreg {
 	hl_type *t;
 	preg *current;
 	preg stack;
+	int dirty; // [OPT step 1] Write-back dirty flag: nonzero=defer_counter that set it, 0=clean
 };
 
 #define REG_AT(i)		(ctx->pregs + (i))
@@ -420,6 +430,7 @@ static preg *paddr( preg *r, void *p ) {
 static void save_regs( jit_ctx *ctx ) {
 	int i;
 	for(i=0;i<REG_COUNT;i++) {
+		// ADD flush here 
 		ctx->savedRegs[i] = ctx->pregs[i].holds;
 		ctx->savedLocks[i] = ctx->pregs[i].lock;
 	}
@@ -427,8 +438,10 @@ static void save_regs( jit_ctx *ctx ) {
 
 static void restore_regs( jit_ctx *ctx ) {
 	int i;
-	for(i=0;i<ctx->maxRegs;i++)
+	for(i=0;i<ctx->maxRegs;i++) {
 		ctx->vregs[i].current = NULL;
+		ctx->vregs[i].dirty = false; // [OPT step 9] Clear dirty flags so restored snapshot starts clean
+	}
 	for(i=0;i<REG_COUNT;i++) {
 		vreg *r = ctx->savedRegs[i];
 		preg *p = ctx->pregs + i;
@@ -944,6 +957,31 @@ static bool is_call_reg( preg *p ) {
 #	endif
 }
 
+static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+
+// [OPT step 2] Write dirty register value back to its stack slot.
+// Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
+static void flush_vreg( jit_ctx *ctx, vreg *r ) {
+	if( r->dirty && r->current && r->size > 0 ) {
+		if( ctx->f && ctx->f->findex == DEBUG_FUNC )
+			printf("  FLUSH vreg %d from reg %d, op%d[%s] bufpos=%d dirty=%d\n",
+				(int)(r - ctx->vregs), r->current->id, ctx->currentPos - 1,
+				hl_op_name(ctx->f->ops[ctx->currentPos - 1].op), BUF_POS(), r->dirty);
+		if( r->dirty == DEFER_MAX ) {
+			int before = BUF_POS();
+			printf("  FLUSH #11893 detail: r->stack.kind=%d r->current->kind=%d r->current->id=%d r->size=%d\n",
+				r->stack.kind, r->current->kind, r->current->id, r->size);
+			copy(ctx, &r->stack, r->current, r->size);
+			int after = BUF_POS();
+			printf("  FLUSH #11893 emitted %d bytes:", after - before);
+			for(int i = before; i < after; i++) printf(" %02x", (unsigned char)ctx->startBuf[i]);
+			printf("\n");
+		} else
+			copy(ctx, &r->stack, r->current, r->size);
+	}
+	r->dirty = false;
+}
+
 static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 	int i;
 	preg *p;
@@ -971,6 +1009,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				if( k == RCPU_CALL && is_call_reg(p) ) continue;
 				if( k == RCPU_8BITS && !is_reg8(p) ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -995,6 +1034,7 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 				preg *p = PXMM((i + off)%count);
 				if( p->lock >= ctx->currentPos ) continue;
 				if( p->holds ) {
+					flush_vreg(ctx, p->holds);
 					RLOCK(p);
 					p->holds->current = NULL;
 					p->holds = NULL;
@@ -1013,27 +1053,38 @@ static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
 static preg *fetch( vreg *r ) {
 	if( r->current )
 		return r->current;
+#	ifdef JIT_DEBUG_DIRTY
+	if( r->dirty ) ASSERT(0); // [OPT debug] If unbound, stack must be current (catch false-clean bugs)
+#	endif
 	return &r->stack;
 }
 
-static void scratch( preg *r ) {
+// [OPT step 3] Flush-aware scratch: flushes dirty vreg before dropping its register binding.
+// Macro captures `ctx` from enclosing scope so all ~58 call sites need zero changes.
+static void scratch_impl( jit_ctx *ctx, preg *r ) {
 	if( r && r->holds ) {
+		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 		r->holds = NULL;
 		r->lock = 0;
 	}
 }
-
-static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
+#define scratch(r) scratch_impl(ctx, r)
 
 static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 	preg *from = fetch(v);
 	if( from == r || v->size == 0 ) return;
-	if( r->holds ) r->holds->current = NULL;
+	if( r->holds ) {
+		// previous vreg cached in r loses its register, flush
+		flush_vreg(ctx, r->holds);
+		r->holds->current = NULL;
+	}
 	if( v->current ) {
+		// v was already cached in another register
 		v->current->holds = NULL;
 		from = r;
 	}
+	// bind the two
 	r->holds = v;
 	v->current = r;
 	copy(ctx,r,from,v->size);
@@ -1273,19 +1324,40 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	return NULL;
 }
 
+static void lstore( jit_ctx *ctx, vreg *r, preg *v ) {
+
+}
+
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
-	if( r->current && r->current != v ) {
-		r->current->holds = NULL;
-		r->current = NULL;
-	}
-	v = copy(ctx,&r->stack,v,r->size);
-	if( IS_FLOAT(r) != (v->kind == RFPU) )
-		ASSERT(0);
-	if( bind && r->current != v && (v->kind == RCPU || v->kind == RFPU) ) {
-		scratch(v);
-		r->current = v;
-		v->holds = r;
-	}
+
+	// free the preg that was previously bound to this vreg, so it can be reused
+    if( r->current && r->current != v ) {
+        r->current->holds = NULL;
+        r->current = NULL;
+    }
+
+    // Emit the actual machine MOV instruction: copy v's value into r's stack slot.
+    // copy() returns the preg that ended up holding the result — for a RCPU→RSTACK
+    // move that is still v (the source register), not &r->stack, because the value
+    // now lives in memory but the source register is what copy() returns when the
+    // destination is a stack slot.
+    v = copy(ctx, &r->stack, v, r->size);
+
+    // Sanity check: a float vreg must be backed by an FPU register, and a non-float
+    // vreg must not be. Mixing the two is a code-generation bug.
+    if( IS_FLOAT(r) != (v->kind == RFPU) )
+        ASSERT(0);
+
+    // Optionally bind: establish the live-cache link so the JIT knows v still holds r.
+    // Only done when bind=true, only when v is an actual hardware register (RCPU/RFPU),
+    // and only when the link isn't already in place (r->current != v).
+    if( bind && r->current != v && (v->kind == RCPU || v->kind == RFPU) ) {
+        scratch(v);      // evict whatever vreg v was previously holding (clears v->holds)
+        r->current = v;  // vreg → preg: "my live copy is in register v"
+        v->holds = r;    // preg → vreg: "this register is reserved for r"
+    }
+
+    r->dirty = false; // value is now consistent with its stack slot; no deferred write-back needed
 }
 
 static void store_result( jit_ctx *ctx, vreg *r ) {
@@ -1349,6 +1421,12 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
+			if( r->holds->dirty) {
+				printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d defer#%d\n",
+					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
+			}
+			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
 		}
@@ -1356,6 +1434,12 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RFPU_COUNT;i++) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
+			if( r->holds->dirty) {
+				printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d defer#%d\n",
+					(int)(r->holds - ctx->vregs), i,
+					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
+			}
+			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
 		}
@@ -2939,6 +3023,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->t = f->regs[i];
 		r->size = hl_type_size(r->t);
 		r->current = NULL;
+		r->dirty = false; // initialize dirty flag for each vreg at function entry
 		r->stack.holds = NULL;
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
@@ -4574,6 +4659,26 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->jumps = NULL;
 	}
 	int codeEndPos = BUF_POS();
+	if( f->findex == DEBUG_FUNC ) {
+		printf("f%d code dump (%d bytes):\n", DEBUG_FUNC, codeEndPos - codePos);
+		for(i = codePos; i < codeEndPos; ) {
+			unsigned char *b = (unsigned char*)ctx->startBuf + i;
+			// detect op marker: 68 [lo16] [hi16] = push imm32 (opCount + findex<<16)
+			if( i + 8 < codeEndPos && b[0] == 0x68 ) {
+				int imm = b[1] | (b[2]<<8) | (b[3]<<16) | (b[4]<<24);
+				int mfid = imm >> 16;
+				int mop = imm & 0xffff;
+				if( mfid == DEBUG_FUNC && mop < f->nops ) {
+					printf("\n  @%02x [%s]: ", mop, hl_op_name(f->ops[mop].op));
+					i += 9; // push imm32 (5) + add rsp,8 (4)
+					continue;
+				}
+			}
+			printf("%02x ", b[0]);
+			i++;
+		}
+		printf("\n");
+	}
 	// add nops padding
 	jit_nops(ctx);
 	// clear regs
