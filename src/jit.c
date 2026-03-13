@@ -37,9 +37,9 @@
 
 #define JIT_LAZYSTORE 1
 
-static int DEBUG_FUNC = 0;
-static int LSTORE_MIN = 4658;
-static int LSTORE_MAX = 4658;
+static int DEBUG_FUNC = 335;
+static int LSTORE_MIN = 0;  // 6000+ - 5970
+static int LSTORE_MAX = 9999999;
 
 typedef enum {
 	Eax = 0,
@@ -1558,7 +1558,7 @@ static void op_mov(jit_ctx* ctx, vreg* to, vreg* from) {
 
 
 static void copy_to( jit_ctx *ctx, vreg *to, preg *from ) {
-	store(ctx,to,from,true);
+	lstore(ctx,to,from);
 }
 
 static void copy_from( jit_ctx *ctx, preg *to, vreg *from ) {
@@ -4837,29 +4837,34 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			break;
 		}
 
-		// flush before ops that are jump targets or that require clean register state
+		// skip flushes for trivial ops that don't branch
 		if( opCount + 1 < f->nops ) {
 			switch( f->ops[opCount+1].op ) {
-			case OJNull: case OJNotNull: case OJTrue: case OJFalse:
-			case OJEq: case OJNotEq:
-			case OJSLt: case OJSGte: case OJSLte: case OJSGt:
-			case OJULt: case OJUGte: case OJNotLt: case OJNotGte:
-			case OJAlways:
-			case OSwitch:
-			case OTrap:
-			case OLabel:
-			case OCallMethod:
-			case OCallThis:
-			case OToDyn:
-				flush_all(ctx);
-				break;
+			// pure moves/loads - no call, no branch
+			case OMov: case OInt: case OFloat: case OBool: case OBytes: case OString: case ONull:
+			// arithmetic - no branch (div/mod excluded)
+			case OAdd: case OSub: case OMul: case ONeg: case ONot: case OIncr: case ODecr:
+			// bitwise
+			case OShl: case OSShr: case OUShr: case OAnd: case OOr: case OXor:
+			// memory access
+			case OGetGlobal: case OSetGlobal: case OGetThis: case OSetThis:
+			case OGetI8: case OGetI16: case OGetMem: case OGetArray:
+			case OSetI8: case OSetI16: case OSetMem: case OSetArray:
+			// cast/type ops (pure SSE/CVT, no branch)
+			case OUnsafeCast: case OToSFloat: case OToInt:
+			// enum/object field access - no call
+			case OEnumIndex: case OEnumField: case OSetEnumField:
+			case OArraySize: case OType: case OGetTID:
+			// ref ops
+			case ORef: case OUnref: case OSetref: case ORefData: case ORefOffset:
 			default:
+				flush_all(ctx);
 				break;
 			}
 		}
 		// we are landing at this position, assume we have lost our registers
 		if( ctx->opsPos[opCount+1] == -1 ) {
-			flush_all(ctx);
+			flush_all(ctx);  // TODO: remove
 			discard_regs(ctx,true);
 		}
 		ctx->opsPos[opCount+1] = BUF_POS();
