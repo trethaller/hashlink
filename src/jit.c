@@ -37,9 +37,9 @@
 
 #define JIT_LAZYSTORE 1
 
-static int DEBUG_FUNC = 12950;
-static int LSTORE_MIN = 727;  // 725 - 730
-static int LSTORE_MAX = 727;
+static int DEBUG_FUNC = 0;
+static int LSTORE_MIN = 4658;
+static int LSTORE_MAX = 4658;
 
 typedef enum {
 	Eax = 0,
@@ -1402,7 +1402,7 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 
         // source: the preg v
         printf("%s-%d", KNAMES[v->kind], v->id);
-        if (v->holds)
+        if (v->holds && (v->kind == RCPU || v->kind == RFPU))
             printf("(v%d @%x)", (int)(v->holds - ctx->vregs), -v->holds->stackPos);
         if (v->kind == RCONST || v->kind == RADDR)
             printf("[%llx]", (unsigned long long)(int_val)v->holds);
@@ -3861,6 +3861,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					// ASM for --> if( hl_vfields(o)[f] ) *hl_vfields(o)[f] = v; else hl_dyn_set(o,hash(field),vt,v)
 					{
 						int jhasfield, jend;
+						flush_all(ctx); // [TEST] flush before branch so both paths have clean state - this fixes the crash !
 						preg *obj = alloc_cpu_call(ctx,dst);
 						preg *r = alloc_reg(ctx,RCPU);
 						op64(ctx,MOV,r,pmem(&p,obj->id,sizeof(vvirtual)+HL_WSIZE*o->p2));
@@ -4848,6 +4849,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			case OTrap:
 			case OLabel:
 			case OCallMethod:
+			case OCallThis:
 				flush_all(ctx);
 				break;
 			default:
