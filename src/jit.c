@@ -38,8 +38,8 @@
 #define JIT_LAZYSTORE 1
 
 static int DEBUG_FUNC = 12950;
-static int LSTORE_MIN = 122;
-static int LSTORE_MAX = 122;
+static int LSTORE_MIN = 727;  // 725 - 730
+static int LSTORE_MAX = 727;
 
 typedef enum {
 	Eax = 0,
@@ -3803,6 +3803,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					{
 						int jhasfield, jend, size;
 						bool need_type = !(IS_FLOAT(dst) || dst->t->kind == HI64);
+						flush_all(ctx); // [OPT] flush before branch so both paths have clean state
 						preg *v = alloc_cpu_call(ctx,ra);
 						preg *r = alloc_reg(ctx,RCPU);
 						op64(ctx,MOV,r,pmem(&p,v->id,sizeof(vvirtual)+HL_WSIZE*o->p3));
@@ -3814,6 +3815,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						set_native_arg(ctx,v);
 						call_native(ctx,get_dynget(dst->t),size);
 						store_result(ctx,dst);
+						flush_vreg(ctx, dst); // [OPT] Flush before mini-merge: has_field path writes stack directly
 						XJump_small(JAlways,jend);
 						patch_jump(ctx,jhasfield);
 						copy_to(ctx, dst, pmem(&p,(CpuReg)r->id,0));
