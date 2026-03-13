@@ -38,8 +38,8 @@
 #define JIT_LAZYSTORE 1
 
 static int DEBUG_FUNC = 335;
-static int LSTORE_MIN = 0;  // 6000+ - 5970
-static int LSTORE_MAX = 9999999;
+static int LSTORE_MIN = 0;  // 412 - 425
+static int LSTORE_MAX = 99999;
 
 typedef enum {
 	Eax = 0,
@@ -1558,7 +1558,17 @@ static void op_mov(jit_ctx* ctx, vreg* to, vreg* from) {
 
 
 static void copy_to( jit_ctx *ctx, vreg *to, preg *from ) {
-	lstore(ctx,to,from);
+	#if JIT_LAZYSTORE
+	preg *tmp;
+	if( IS_FLOAT(to) )
+		tmp = alloc_reg(ctx, RFPU);
+	else
+		tmp = alloc_reg(ctx, RCPU);
+	copy(ctx, tmp, from, to->size);
+	lstore(ctx, to, tmp);
+	#else
+	store(ctx, to, from, true);
+	#endif
 }
 
 static void copy_from( jit_ctx *ctx, preg *to, vreg *from ) {
@@ -3818,7 +3828,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						flush_vreg(ctx, dst); // [OPT] Flush before mini-merge: has_field path writes stack directly
 						XJump_small(JAlways,jend);
 						patch_jump(ctx,jhasfield);
-						copy_to(ctx, dst, pmem(&p,(CpuReg)r->id,0));
+						store(ctx, dst, pmem(&p, (CpuReg)r->id, 0), true);
 						patch_jump(ctx,jend);
 						scratch(dst->current);
 					}
@@ -4852,7 +4862,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			case OSetI8: case OSetI16: case OSetMem: case OSetArray:
 			// cast/type ops (pure SSE/CVT, no branch)
 			case OUnsafeCast: case OToSFloat: case OToInt:
-			// enum/object field access - no call
+			// enum/object field access
+			case OField: case OSetField:
 			case OEnumIndex: case OEnumField: case OSetEnumField:
 			case OArraySize: case OType: case OGetTID:
 			// ref ops
