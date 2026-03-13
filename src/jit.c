@@ -41,7 +41,7 @@
 static int defer_counter = 0;
 #define DEFER_MIN 0
 #define DEFER_MAX 75000
-static int DEBUG_FUNC = 0;
+static int DEBUG_FUNC = 28;
 
 typedef enum {
 	Eax = 0,
@@ -962,22 +962,30 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size );
 // [OPT step 2] Write dirty register value back to its stack slot.
 // Safe from re-entrancy: copy(RSTACK, RCPU/RFPU) emits a direct MOV, never calls alloc_reg().
 static void flush_vreg( jit_ctx *ctx, vreg *r ) {
-	if( r->dirty && r->current && r->size > 0 ) {
-		if( ctx->f && ctx->f->findex == DEBUG_FUNC )
-			printf("  FLUSH vreg %d from reg %d, op%d[%s] bufpos=%d dirty=%d\n",
-				(int)(r - ctx->vregs), r->current->id, ctx->currentPos - 1,
-				hl_op_name(ctx->f->ops[ctx->currentPos - 1].op), BUF_POS(), r->dirty);
-		if( r->dirty == DEFER_MAX ) {
-			int before = BUF_POS();
-			printf("  FLUSH #11893 detail: r->stack.kind=%d r->current->kind=%d r->current->id=%d r->size=%d\n",
-				r->stack.kind, r->current->kind, r->current->id, r->size);
-			copy(ctx, &r->stack, r->current, r->size);
-			int after = BUF_POS();
-			printf("  FLUSH #11893 emitted %d bytes:", after - before);
-			for(int i = before; i < after; i++) printf(" %02x", (unsigned char)ctx->startBuf[i]);
-			printf("\n");
-		} else
-			copy(ctx, &r->stack, r->current, r->size);
+	if( r->dirty ) {
+		if( r->current == NULL ) 
+			ASSERT(0); // Dirty regsiter lost its preg
+		if( r->size == 0 )
+			ASSERT(0); // What ?
+		// if( ctx->f && ctx->f->findex == DEBUG_FUNC )
+		// 	printf("  FLUSH vreg %d from reg %d, op%d[%s] bufpos=%d dirty=%d\n",
+		// 		(int)(r - ctx->vregs), r->current->id, ctx->currentPos - 1,
+		// 		hl_op_name(ctx->f->ops[ctx->currentPos - 1].op), BUF_POS(), r->dirty);
+		// if( r->dirty == DEFER_MAX ) {
+		// 	int before = BUF_POS();
+		// 	printf("  FLUSH #11893 detail: r->stack.kind=%d r->current->kind=%d r->current->id=%d r->size=%d\n",
+		// 		r->stack.kind, r->current->kind, r->current->id, r->size);
+		// 	copy(ctx, &r->stack, r->current, r->size);
+		// 	int after = BUF_POS();
+		// 	printf("  FLUSH #11893 emitted %d bytes:", after - before);
+		// 	for(int i = before; i < after; i++) printf(" %02x", (unsigned char)ctx->startBuf[i]);
+		// 	printf("\n");
+		// } else
+		if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
+			printf("FLUSH\n");
+		}
+
+		copy(ctx, &r->stack, r->current, r->size);
 	}
 	r->dirty = false;
 }
@@ -1079,11 +1087,12 @@ static void load( jit_ctx *ctx, preg *r, vreg *v ) {
 		flush_vreg(ctx, r->holds);
 		r->holds->current = NULL;
 	}
-	if( v->current ) {
-		// v was already cached in another register
-		v->current->holds = NULL;
-		from = r;
-	}
+	// Dead code: never runs on Mog
+	//if( v->current ) {
+	//	// v was already cached in another register
+	//	v->current->holds = NULL;
+	//	from = r;
+	//}
 	// bind the two
 	r->holds = v;
 	v->current = r;
@@ -1204,7 +1213,33 @@ static preg *alloc_cpu8( jit_ctx *ctx, vreg *r, bool andLoad ) {
 	return p;
 }
 
+static int cnt = 0;
 static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
+	/*
+	if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
+		printf("COPY  %d\t", ++cnt);
+
+		// --- TO ---
+		printf("%s-%d", KNAMES[to->kind], to->id);
+		if (to->holds)
+			printf("(v%d @-%x dirty=%d)", (int)(to->holds - ctx->vregs), -to->holds->stackPos, to->holds->dirty);
+		if (to->kind == RCONST || to->kind == RADDR)
+			printf("[%llx]", (unsigned long long)(int_val)to->holds);
+
+		printf("  <-  ");
+
+		// --- FROM ---
+		printf("%s-%d", KNAMES[from->kind], from->id);
+		if (from->holds)
+			printf("(v%d @-%x dirty=%d)", (int)(from->holds - ctx->vregs), -from->holds->stackPos, from->holds->dirty);
+		if (from->kind == RCONST || from->kind == RADDR)
+			printf("[%llx]", (unsigned long long)(int_val)from->holds);
+
+		if (cnt == 24)
+			printf(" !!!");
+
+		printf("\n");
+	}*/
 	if( size == 0 || to == from ) return to;
 	switch( ID2(to->kind,from->kind) ) {
 	case ID2(RMEM,RCPU):
@@ -1324,9 +1359,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	return NULL;
 }
 
-static void lstore( jit_ctx *ctx, vreg *r, preg *v ) {
 
-}
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 
@@ -1360,6 +1393,33 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
     r->dirty = false; // value is now consistent with its stack slot; no deferred write-back needed
 }
 
+static int lstore_cnt = 0;
+static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
+	if (false && (v->kind == RCPU || v->kind == RFPU)) {
+		if (r->current != v) {
+			scratch(v);
+			r->current = v;
+			v->holds = r;
+		}
+		++lstore_cnt;
+		printf("LSTORE #%d\tv%d(@-%x size=%d %s) <- %s-%d",
+			lstore_cnt,
+			(int)(r - ctx->vregs),
+			-r->stackPos,
+			r->size,
+			hl_type_str(r->t),
+			KNAMES[v->kind],
+			v->id);
+		if (v->holds && v->holds != r)
+			printf(" (was holding v%d)", (int)(v->holds - ctx->vregs));
+		printf("  dirty: %d -> %d\n", r->dirty, lstore_cnt);
+		r->dirty = lstore_cnt;
+	}
+	else {
+		store(ctx, r, v, true);
+	}
+}
+
 static void store_result( jit_ctx *ctx, vreg *r ) {
 #	ifndef HL_64
 	switch( r->t->kind ) {
@@ -1384,18 +1444,39 @@ static void store_result( jit_ctx *ctx, vreg *r ) {
 #	endif
 }
 
+static void op_mov(jit_ctx* ctx, vreg* to, vreg* from) {
+	preg* r = fetch(from);
+#	ifndef HL_64
+	if (to->t->kind == HI64) {
+		error_i64();
+		return;
+	}
+#	endif
+	if (from->t->kind == HF32 && r->kind != RFPU)
+		r = alloc_fpu(ctx, from, true);
+	store(ctx, to, r, true);
+}
+
+/*
 static void op_mov( jit_ctx *ctx, vreg *to, vreg *from ) {
-	preg *r = fetch(from);
+	preg *rfrom = fetch(from);
 #	ifndef HL_64
 	if( to->t->kind == HI64 ) {
 		error_i64();
 		return;
 	}
 #	endif
-	if( from->t->kind == HF32 && r->kind != RFPU )
-		r = alloc_fpu(ctx,from,true);
-	store(ctx, to, r, true);
-}
+	if (cnt == 23)
+		printf("op_mov %d\n", cnt);
+	hl_type_kind tk = from->t->kind;
+	preg* rto;
+	if(tk == HF32 || tk == HF64)
+		rto = alloc_reg(ctx, RFPU);
+	else
+		rto = alloc_reg(ctx, RCPU);
+	copy(ctx, rto, rfrom, from->size);
+	lstore(ctx, to, rto);
+}*/
 
 static void copy_to( jit_ctx *ctx, vreg *to, preg *from ) {
 	store(ctx,to,from,true);
@@ -1421,11 +1502,12 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RCPU_SCRATCH_COUNT;i++) {
 		preg *r = ctx->pregs + RCPU_SCRATCH_REGS[i];
 		if( r->holds ) {
-			if( r->holds->dirty) {
-				printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d defer#%d\n",
-					(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
-					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
-			}
+			//flush_vreg(ctx, r->holds);
+			//if( r->holds->dirty) {
+			//	printf("WARN: dirty vreg %d in reg %d, f%d op%d bufpos=%d native=%d defer#%d\n",
+			//		(int)(r->holds - ctx->vregs), RCPU_SCRATCH_REGS[i],
+			//		ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
+			//}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
@@ -1434,11 +1516,12 @@ static void discard_regs( jit_ctx *ctx, bool native_call ) {
 	for(i=0;i<RFPU_COUNT;i++) {
 		preg *r = ctx->pregs + XMM(i);
 		if( r->holds ) {
-			if( r->holds->dirty) {
-				printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d defer#%d\n",
-					(int)(r->holds - ctx->vregs), i,
-					ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
-			}
+			//flush_vreg(ctx, r->holds);
+			//if( r->holds->dirty) {
+			//	printf("WARN: dirty vreg %d in xmm%d, f%d op%d bufpos=%d native=%d defer#%d\n",
+			//		(int)(r->holds - ctx->vregs), i,
+			//		ctx->f ? ctx->f->findex : -1, ctx->currentPos - 1, BUF_POS(), native_call, r->holds->dirty);
+			//}
 			r->holds->dirty = false;
 			r->holds->current = NULL;
 			r->holds = NULL;
@@ -2054,7 +2137,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			printf("%s(%d,%d)\n", hl_op_name(bop), pa->kind, pb->kind);
 			ASSERT(ID2(pa->kind, pb->kind));
 		}
-		if( dst ) store(ctx, dst, out, true);
+		if( dst )
+			lstore(ctx, dst, out);
 		return out;
 	default:
 		ASSERT(RTYPE(a));
@@ -3096,6 +3180,15 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			int uid = opCount + (f->findex<<16);
 			op32(ctx, PUSH, pconst(&p,uid), UNUSED);
 			op64(ctx, ADD, PESP, pconst(&p,HL_WSIZE));
+			static int qsdsdf = 0;
+			if (uid == 0x17000f) {
+				printf(">>>>\n");
+				qsdsdf = 1;
+			}
+			else if (qsdsdf > 1) {
+				printf("<<<<\n");
+				qsdsdf = 2;
+			}
 		}
 #		endif
 		// emit code
@@ -4659,6 +4752,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->jumps = NULL;
 	}
 	int codeEndPos = BUF_POS();
+	/*
 	if( f->findex == DEBUG_FUNC ) {
 		printf("f%d code dump (%d bytes):\n", DEBUG_FUNC, codeEndPos - codePos);
 		for(i = codePos; i < codeEndPos; ) {
@@ -4678,7 +4772,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			i++;
 		}
 		printf("\n");
-	}
+	}*/
 	// add nops padding
 	jit_nops(ctx);
 	// clear regs
