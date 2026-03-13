@@ -1238,12 +1238,12 @@ static preg *alloc_cpu8( jit_ctx *ctx, vreg *r, bool andLoad ) {
 static int cnt = 0;
 static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
-		printf("COPY  %d\t", ++cnt);
+		printf("    COPY %d ", ++cnt);
 
 		// --- TO ---
 		printf("%s-%d", KNAMES[to->kind], to->id);
 		if (to->holds)
-			printf("(v%d @-%x dirty=%d)", (int)(to->holds - ctx->vregs), -to->holds->stackPos, to->holds->dirty);
+			printf("(r%d @%x)", (int)(to->holds - ctx->vregs), -to->holds->stackPos);
 		if (to->kind == RCONST || to->kind == RADDR)
 			printf("[%llx]", (unsigned long long)(int_val)to->holds);
 
@@ -1252,12 +1252,12 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 		// --- FROM ---
 		printf("%s-%d", KNAMES[from->kind], from->id);
 		if (from->holds)
-			printf("(v%d @-%x dirty=%d)", (int)(from->holds - ctx->vregs), -from->holds->stackPos, from->holds->dirty);
+			printf("(r%d @%x)", (int)(from->holds - ctx->vregs), -from->holds->stackPos);
 		if (from->kind == RCONST || from->kind == RADDR)
 			printf("[%llx]", (unsigned long long)(int_val)from->holds);
 
-		if (cnt == 24)
-			printf(" !!!");
+		// if (cnt == 24)
+		// 	printf(" !!!");
 
 		printf("\n");
 	}
@@ -1409,6 +1409,15 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
         v->holds = r;    // preg → vreg: "this register is reserved for r"
     }
 
+	if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
+		printf("STORE v%d(@%x %s) <- %s-%d",
+			(int)(r - ctx->vregs),
+			-r->stackPos,
+			hl_type_str(r->t),
+			KNAMES[v->kind],
+			v->id);
+		printf("\n");
+	}
     r->dirty = false; // value is now consistent with its stack slot; no deferred write-back needed
 }
 
@@ -1426,17 +1435,18 @@ static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
 			v->holds = r;
 		}
 		++lstore_cnt;
-		printf("LSTORE #%d\tv%d(@-%x size=%d %s) <- %s-%d",
-			lstore_cnt,
-			(int)(r - ctx->vregs),
-			-r->stackPos,
-			r->size,
-			hl_type_str(r->t),
-			KNAMES[v->kind],
-			v->id);
-		if (v->holds && v->holds != r)
-			printf(" (was holding v%d)", (int)(v->holds - ctx->vregs));
-		printf("  dirty: %d -> %d\n", r->dirty, lstore_cnt);
+		if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
+			printf("LSTORE #%d v%d(@%x %s) <- %s-%d",
+				lstore_cnt,
+				(int)(r - ctx->vregs),
+				-r->stackPos,
+				hl_type_str(r->t),
+				KNAMES[v->kind],
+				v->id);
+			if (v->holds && v->holds != r)
+				printf(" (was holding v%d)", (int)(v->holds - ctx->vregs));
+			printf("\n");
+		}
 		r->dirty = lstore_cnt;
 	}
 	else
@@ -2164,7 +2174,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 				}
 				patch_jump(ctx,jnotnan);
 			}
-			scratch(pa);
+			// scratch(pa);
 			out = pa;
 			break;
 		default:
