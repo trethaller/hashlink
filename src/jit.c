@@ -37,8 +37,9 @@
 
 #define JIT_LAZYSTORE 1
 
-static int defer_counter = 0;
-static int DEBUG_FUNC = 335;
+static int DEBUG_FUNC = 7;
+static int LSTORE_MIN = 78;
+static int LSTORE_MAX = 78;
 
 typedef enum {
 	Eax = 0,
@@ -970,6 +971,10 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 		}
 
 		copy(ctx, &r->stack, r->current, r->size);
+
+		if (r->dirty == LSTORE_MAX) {
+			printf("^ INVALID FLUSH CAUSES BUG\n");
+		}
 	}
 	r->dirty = false;
 	#endif
@@ -1235,10 +1240,10 @@ static preg *alloc_cpu8( jit_ctx *ctx, vreg *r, bool andLoad ) {
 	return p;
 }
 
-static int cnt = 0;
+static int copy_cnt = 0;
 static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 	if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
-		printf("    COPY %d ", ++cnt);
+		printf("    COPY %d ", ++copy_cnt);
 
 		// --- TO ---
 		printf("%s-%d", KNAMES[to->kind], to->id);
@@ -1256,7 +1261,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 		if (from->kind == RCONST || from->kind == RADDR)
 			printf("[%llx]", (unsigned long long)(int_val)from->holds);
 
-		// if (cnt == 24)
+		//if (copy_cnt == 3)
 		// 	printf(" !!!");
 
 		printf("\n");
@@ -1424,6 +1429,11 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
 static int lstore_cnt = 0;
 static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
 	#if JIT_LAZYSTORE
+	++lstore_cnt;
+	if(lstore_cnt < LSTORE_MIN || lstore_cnt > LSTORE_MAX) {
+		store(ctx, r, v, true);
+		return;
+	}
 	if ((v->kind == RCPU || v->kind == RFPU)) {
 		// lstore always binds v to r
 		// if r is already bound, 
@@ -1434,8 +1444,7 @@ static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
 			r->current = v;
 			v->holds = r;
 		}
-		++lstore_cnt;
-		if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
+		if(ctx->f && ctx->f->findex == DEBUG_FUNC || lstore_cnt == LSTORE_MAX) {
 			printf("LSTORE #%d v%d(@%x %s) <- %s-%d",
 				lstore_cnt,
 				(int)(r - ctx->vregs),
@@ -1445,6 +1454,8 @@ static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
 				v->id);
 			if (v->holds && v->holds != r)
 				printf(" (was holding v%d)", (int)(v->holds - ctx->vregs));
+			if (lstore_cnt == LSTORE_MAX)
+				printf("  <------ This causes a bug");
 			printf("\n");
 		}
 		r->dirty = lstore_cnt;
@@ -1657,8 +1668,8 @@ static void set_native_arg( jit_ctx *ctx, preg *r ) {
 	}
 	target = REG_AT(CALL_REGS[rid]);
 	if( target != r ) {
-		op64(ctx, MOV, target, r);
 		scratch(target);
+		op64(ctx, MOV, target, r);
 	}
 #	else
 	op32(ctx,PUSH,r,UNUSED);
@@ -1672,8 +1683,8 @@ static void set_native_arg_fpu( jit_ctx *ctx, preg *r, bool isf32 ) {
 	ctx->nativeArgsCount--;
 	preg *target = REG_AT(XMM(IS_WINCALL64 ? ctx->nativeArgsCount : 0));
 	if( target != r ) {
-		op64(ctx, isf32 ? MOVSS : MOVSD, target, r);
 		scratch(target);
+		op64(ctx, isf32 ? MOVSS : MOVSD, target, r);
 	}
 #	else
 	op32(ctx,PUSH,r,UNUSED);
@@ -1730,8 +1741,8 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 			preg *c = REG_AT(cr);
 			preg *cur = fetch(r);
 			if( cur != c ) {
-				copy(ctx,c,cur,r->size);
 				scratch(c);
+				copy(ctx,c,cur,r->size);
 			}
 			RLOCK(c);
 			continue;
@@ -2065,8 +2076,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			op32(ctx, o, pa, pb);
 			scratch(pa);
+			op32(ctx, o, pa, pb);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -2107,8 +2118,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			op64(ctx, o, pa, pb);
 			scratch(pa);
+			op64(ctx, o, pa, pb);
 			out = pa;
 			break;
 		case ID2(RSTACK,RCPU):
@@ -3497,8 +3508,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				store(ctx, dst, w, true);
 			} else if( (dst->t->kind == HI64 || dst->t->kind == HGUID) && ra->t->kind == HI32 ) {
 				if( ra->current != PEAX ) {
-					op32(ctx, MOV, PEAX, fetch(ra));
 					scratch(PEAX);
+					op32(ctx, MOV, PEAX, fetch(ra));
 				}
 #				ifdef HL_64
 				op64(ctx, CDQE, UNUSED, UNUSED); // sign-extend Eax into Rax
@@ -3719,7 +3730,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					if( o->p3 >= 63 ) jit_error("assert");
 					memcpy(regids + 1, o->extra, o->p3 * sizeof(int));
 					regids[0] = f->nregs;
-					flush_all(ctx); // Flush BEFORE temporary rebind of sc
+					flush_all(ctx); // Flush BEFORE temporary rebind of sc - TODO: is that just because the scratch should be BEFORE ?
 					sc->size = HL_WSIZE;
 					sc->t = &hlt_dyn;
 					op64(ctx, MOV, pc, pmem(&p,r->id,HL_WSIZE*3));
@@ -4075,8 +4086,8 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 						regids[0] = f->nregs;
 						sc->size = HL_WSIZE;
 						sc->t = &hlt_dyn;
-						op64(ctx, MOV, pc, pmem(&p,v->id,HL_WSIZE));
 						scratch(pc);
+						op64(ctx, MOV, pc, pmem(&p,v->id,HL_WSIZE));
 						sc->current = pc;
 						pc->holds = sc;
 						size = prepare_call_args(ctx,o->p3,regids,ctx->vregs,0);
@@ -4842,6 +4853,26 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		ctx->jumps = NULL;
 	}
 	int codeEndPos = BUF_POS();
+	if( f->findex == DEBUG_FUNC ) {
+		printf("f%d code dump (%d bytes):\n", DEBUG_FUNC, codeEndPos - codePos);
+		for(i = codePos; i < codeEndPos; ) {
+			unsigned char *b = (unsigned char*)ctx->startBuf + i;
+			// detect op marker: 68 [lo16] [hi16] = push imm32 (opCount + findex<<16)
+			if( i + 8 < codeEndPos && b[0] == 0x68 ) {
+				int imm = b[1] | (b[2]<<8) | (b[3]<<16) | (b[4]<<24);
+				int mfid = imm >> 16;
+				int mop = imm & 0xffff;
+				if( mfid == DEBUG_FUNC && mop < f->nops ) {
+					printf("\n  @%02x [%s]: ", mop, hl_op_name(f->ops[mop].op));
+					i += 9; // push imm32 (5) + add rsp,8 (4)
+					continue;
+				}
+			}
+			printf("%02x ", b[0]);
+			i++;
+		}
+		printf("\n");
+	}
 	// add nops padding
 	jit_nops(ctx);
 	// clear regs
