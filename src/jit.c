@@ -2133,7 +2133,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			printf("%s(%d,%d)\n", hl_op_name(bop), pa->kind, pb->kind);
 			ASSERT(ID2(pa->kind, pb->kind));
 		}
-		if( dst ) store(ctx, dst, out, true);
+		if( dst ) lstore(ctx, dst, out);
 		return out;
 #	ifdef HL_64
 	case HOBJ:
@@ -2175,7 +2175,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			printf("%s(%d,%d)\n", hl_op_name(bop), pa->kind, pb->kind);
 			ASSERT(ID2(pa->kind, pb->kind));
 		}
-		if( dst ) store(ctx, dst, out, true);
+		if( dst ) lstore(ctx, dst, out);
 		return out;
 #	endif
 	case HF64:
@@ -2228,8 +2228,7 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 			printf("%s(%d,%d)\n", hl_op_name(bop), pa->kind, pb->kind);
 			ASSERT(ID2(pa->kind, pb->kind));
 		}
-		if( dst )
-			lstore(ctx, dst, out);
+		if( dst ) lstore(ctx, dst, out);
 		return out;
 	default:
 		ASSERT(RTYPE(a));
@@ -4868,6 +4867,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			case OArraySize: case OType: case OGetTID:
 			// ref ops
 			case ORef: case OUnref: case OSetref: case ORefData: case ORefOffset:
+				break;
 			default:
 				flush_all(ctx);
 				break;
