@@ -4850,6 +4850,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 			case OLabel:
 			case OCallMethod:
 			case OCallThis:
+			case OToDyn:
 				flush_all(ctx);
 				break;
 			default:
