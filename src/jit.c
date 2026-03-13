@@ -966,7 +966,7 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 		if( r->size == 0 )
 			ASSERT(0); // What ?
 		if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
-			printf("FLUSH\n");
+			printf("FLUSH ");
 		}
 
 		copy(ctx, &r->stack, r->current, r->size);
@@ -975,18 +975,44 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 	#endif
 }
 
-static void flush_all( jit_ctx *ctx ) {
-	#if JIT_LAZYSTORE
+static void check_regs(jit_ctx* ctx) {
 	int i;
-	for(i=0;i<RCPU_COUNT;i++) {
-		preg *r = ctx->pregs + i;
-		if( r->holds ) flush_vreg(ctx, r->holds);
+	for (i = 0; i < RCPU_COUNT; i++) {
+		preg* r = ctx->pregs + i;
+		if (r->holds && r->holds->dirty == 0xcdcdcdcd) 
+			ASSERT(0);
 	}
-	for(i=0;i<RFPU_COUNT;i++) {
-		preg *r = ctx->pregs + XMM(i);
-		if( r->holds ) flush_vreg(ctx, r->holds);
+	for (i = 0; i < RFPU_COUNT; i++) {
+		preg* r = ctx->pregs + XMM(i);
+		if (r->holds && r->holds->dirty == 0xcdcdcdcd) 
+			ASSERT(0);
 	}
-	#endif
+}
+
+static void flush_all(jit_ctx* ctx) {
+#if JIT_LAZYSTORE
+	/*
+	int i;
+	for (i = 0; i < RCPU_SCRATCH_COUNT; i++) {
+		preg* r = ctx->pregs + RCPU_SCRATCH_REGS[i];
+		if (r->holds) flush_vreg(ctx, r->holds);
+	}
+	for (i = 0; i < RFPU_SCRATCH_COUNT; i++) {
+		preg* r = ctx->pregs + XMM(i);
+		if (r->holds) flush_vreg(ctx, r->holds);
+	}
+	*/
+
+	int i;
+	for (i = 0; i < RCPU_COUNT; i++) {
+		preg* r = ctx->pregs + i;
+		if (r->holds) flush_vreg(ctx, r->holds);
+	}
+	for (i = 0; i < RFPU_COUNT; i++) {
+		preg* r = ctx->pregs + XMM(i);
+		if (r->holds) flush_vreg(ctx, r->holds);
+	}
+#endif
 }
 
 static preg *alloc_reg( jit_ctx *ctx, preg_kind k ) {
@@ -1390,7 +1416,11 @@ static int lstore_cnt = 0;
 static void lstore(jit_ctx* ctx, vreg* r, preg* v) {
 	#if JIT_LAZYSTORE
 	if ((v->kind == RCPU || v->kind == RFPU)) {
+		// lstore always binds v to r
+		// if r is already bound, 
 		if (r->current != v) {
+			if (r->current)
+				r->current->holds = NULL;
 			scratch(v);
 			r->current = v;
 			v->holds = r;
@@ -1713,7 +1743,6 @@ static int prepare_call_args( jit_ctx *ctx, int count, int *args, vreg *vregs, i
 
 static void op_call( jit_ctx *ctx, preg *r, int size ) {
 	preg p;
-	flush_all(ctx); 
 #	ifdef JIT_DEBUG
 	if( IS_64 && size >= 0 ) {
 		int jchk;
@@ -1733,6 +1762,7 @@ static void op_call( jit_ctx *ctx, preg *r, int size ) {
 }
 
 static void call_native( jit_ctx *ctx, void *nativeFun, int size ) {
+	flush_all(ctx);
 	bool isExc = nativeFun == hl_assert || nativeFun == hl_throw || nativeFun == on_jit_error;
 	preg p;
 	// native function, already resolved
@@ -1744,6 +1774,7 @@ static void call_native( jit_ctx *ctx, void *nativeFun, int size ) {
 }
 
 static void op_call_fun( jit_ctx *ctx, vreg *dst, int findex, int count, int *args ) {
+	flush_all(ctx);
 	int fid = findex < 0 ? -1 : ctx->m->functions_indexes[findex];
 	bool isNative = fid >= ctx->m->code->nfunctions;
 	int size = prepare_call_args(ctx,count,args,ctx->vregs,0);
@@ -3115,6 +3146,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		r->stack.id = i;
 		r->stack.kind = RSTACK;
 	}
+	for(i=0;i<REG_COUNT;i++) {
+		ctx->pregs[i].holds = NULL;
+		ctx->pregs[i].lock = 0;
+	}
 	size = 0;
 	int argsSize = 0;
 	for(i=0;i<nargs;i++) {
@@ -3203,6 +3238,9 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		case OJULt: case OJUGte: case OJNotLt: case OJNotGte:
 		case OJAlways:
 		case OSwitch:
+		case OTrap:
+		case OLabel:
+		case OCallMethod:
 			flush_all(ctx);
 			break;
 		default:
@@ -3649,13 +3687,20 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				scratch(tmp);
 				XJump_small(JNotZero,jhasvalue);
 				save_regs(ctx);
+				check_regs(ctx);
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
 				preg *rr = r;
+				check_regs(ctx);
 				if( rr->holds != ra ) rr = alloc_cpu(ctx, ra, true);
+				check_regs(ctx);
 				op_call(ctx, pmem(&p,rr->id,HL_WSIZE), size);
+				check_regs(ctx);
 				XJump_small(JAlways,jend);
+				check_regs(ctx);
 				patch_jump(ctx,jhasvalue);
+				check_regs(ctx);
 				restore_regs(ctx);
+				check_regs(ctx);
 #				ifdef HL_64
 				{
 					int regids[64];
@@ -3664,10 +3709,12 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 					if( o->p3 >= 63 ) jit_error("assert");
 					memcpy(regids + 1, o->extra, o->p3 * sizeof(int));
 					regids[0] = f->nregs;
+					flush_all(ctx); // Flush BEFORE temporary rebind of sc
 					sc->size = HL_WSIZE;
 					sc->t = &hlt_dyn;
 					op64(ctx, MOV, pc, pmem(&p,r->id,HL_WSIZE*3));
 					scratch(pc);
+					sc->dirty = false; // temporary bind should never carry stale dirty state
 					sc->current = pc;
 					pc->holds = sc;
 					size = prepare_call_args(ctx,o->p3 + 1,regids,ctx->vregs,0);
@@ -3678,8 +3725,11 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				if( r->holds != ra ) r = alloc_cpu(ctx, ra, true);
 				op64(ctx, PUSH,pmem(&p,r->id,HL_WSIZE*3),UNUSED); // push closure value
 #				endif
+				check_regs(ctx);
 				op_call(ctx, pmem(&p,r->id,HL_WSIZE), size);
+				check_regs(ctx);
 				discard_regs(ctx,false);
+				check_regs(ctx);
 				patch_jump(ctx,jend);
 				store_result(ctx, dst);
 			}
@@ -3905,14 +3955,23 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		case OCallMethod:
 			switch( R(o->extra[0])->t->kind ) {
 			case HOBJ: {
+				check_regs(ctx);
 				int size;
 				preg *r = alloc_cpu(ctx, R(o->extra[0]), true);
 				preg *tmp;
 				tmp = alloc_reg(ctx, RCPU_CALL);
+				check_regs(ctx);
+
 				op64(ctx,MOV,tmp,pmem(&p,r->id,0)); // read type
 				op64(ctx,MOV,tmp,pmem(&p,tmp->id,HL_WSIZE*2)); // read proto
+				check_regs(ctx);
+
 				size = prepare_call_args(ctx,o->p3,o->extra,ctx->vregs,0);
+				check_regs(ctx);
+
 				op_call(ctx,pmem(&p,tmp->id,o->p2*HL_WSIZE),size);
+				check_regs(ctx);
+
 				discard_regs(ctx, false);
 				store_result(ctx, dst);
 				break;
