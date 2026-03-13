@@ -3277,23 +3277,6 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		}
 #		endif
 
-#if JIT_LAZYSTORE
-		switch (o->op) {
-		case OJNull: case OJNotNull: case OJTrue: case OJFalse:
-		case OJEq: case OJNotEq:
-		case OJSLt: case OJSGte: case OJSLte: case OJSGt:
-		case OJULt: case OJUGte: case OJNotLt: case OJNotGte:
-		case OJAlways:
-		case OSwitch:
-		case OTrap:
-		case OLabel:
-		case OCallMethod:
-			flush_all(ctx);
-			break;
-		default:
-			break;
-		}
-#endif
 
 		// emit code
 		switch( o->op ) {
@@ -4849,6 +4832,25 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		default:
 			jit_error(hl_op_name(o->op));
 			break;
+		}
+
+		// flush before ops that are jump targets or that require clean register state
+		if( opCount + 1 < f->nops ) {
+			switch( f->ops[opCount+1].op ) {
+			case OJNull: case OJNotNull: case OJTrue: case OJFalse:
+			case OJEq: case OJNotEq:
+			case OJSLt: case OJSGte: case OJSLte: case OJSGt:
+			case OJULt: case OJUGte: case OJNotLt: case OJNotGte:
+			case OJAlways:
+			case OSwitch:
+			case OTrap:
+			case OLabel:
+			case OCallMethod:
+				flush_all(ctx);
+				break;
+			default:
+				break;
+			}
 		}
 		// we are landing at this position, assume we have lost our registers
 		if( ctx->opsPos[opCount+1] == -1 ) {
