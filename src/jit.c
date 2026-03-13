@@ -37,9 +37,9 @@
 
 #define JIT_LAZYSTORE 1
 
-static int DEBUG_FUNC = 7;
-static int LSTORE_MIN = 78;
-static int LSTORE_MAX = 78;
+static int DEBUG_FUNC = 12950;
+static int LSTORE_MIN = 122;
+static int LSTORE_MAX = 122;
 
 typedef enum {
 	Eax = 0,
@@ -967,7 +967,14 @@ static void flush_vreg( jit_ctx *ctx, vreg *r ) {
 		if( r->size == 0 )
 			ASSERT(0); // What ?
 		if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
-			printf("FLUSH ");
+			printf("FLUSH v%d(@%x %s) dirty=#%d  <-  %s-%d",
+				(int)(r - ctx->vregs),
+				-r->stackPos,
+				hl_type_str(r->t),
+				r->dirty,
+				KNAMES[r->current->kind],
+				r->current->id);
+			printf("\n");
 		}
 
 		copy(ctx, &r->stack, r->current, r->size);
@@ -1242,7 +1249,7 @@ static preg *alloc_cpu8( jit_ctx *ctx, vreg *r, bool andLoad ) {
 
 static int copy_cnt = 0;
 static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
-	if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
+	/*if (ctx->f && ctx->f->findex == DEBUG_FUNC) {
 		printf("    COPY %d ", ++copy_cnt);
 
 		// --- TO ---
@@ -1265,7 +1272,7 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 		// 	printf(" !!!");
 
 		printf("\n");
-	}
+	}*/
 	if( size == 0 || to == from ) return to;
 	switch( ID2(to->kind,from->kind) ) {
 	case ID2(RMEM,RCPU):
@@ -1386,7 +1393,24 @@ static preg *copy( jit_ctx *ctx, preg *to, preg *from, int size ) {
 }
 
 static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
+    if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
+        // destination: the vreg's stack slot
+        printf("STORE %s-%d", KNAMES[r->stack.kind], r->stack.id);
+        printf("(v%d @%x %s)", (int)(r - ctx->vregs), -r->stackPos, hl_type_str(r->t));
 
+        printf("  <-  ");
+
+        // source: the preg v
+        printf("%s-%d", KNAMES[v->kind], v->id);
+        if (v->holds)
+            printf("(v%d @%x)", (int)(v->holds - ctx->vregs), -v->holds->stackPos);
+        if (v->kind == RCONST || v->kind == RADDR)
+            printf("[%llx]", (unsigned long long)(int_val)v->holds);
+
+        printf("  bind=%d", bind);
+        printf("\n");
+    }
+	
 	// free the preg that was previously bound to this vreg, so it can be reused
     if( r->current && r->current != v ) {
         r->current->holds = NULL;
@@ -1414,15 +1438,17 @@ static void store( jit_ctx *ctx, vreg *r, preg *v, bool bind ) {
         v->holds = r;    // preg → vreg: "this register is reserved for r"
     }
 
-	if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
-		printf("STORE v%d(@%x %s) <- %s-%d",
-			(int)(r - ctx->vregs),
-			-r->stackPos,
-			hl_type_str(r->t),
-			KNAMES[v->kind],
-			v->id);
-		printf("\n");
-	}
+	// if(ctx->f && ctx->f->findex == DEBUG_FUNC) {
+	// 	printf("STORE v%d(@%x %s) <- %s-%d",
+	// 		(int)(r - ctx->vregs),
+	// 		-r->stackPos,
+	// 		hl_type_str(r->t),
+	// 		KNAMES[v->kind],
+	// 		v->id);
+	// 	if(v->holds && v->holds != r)
+	// 		printf(" (holding r%d)", (int)(v->holds - ctx->vregs));
+	// 	printf("\n");
+	// }
     r->dirty = false; // value is now consistent with its stack slot; no deferred write-back needed
 }
 
