@@ -38,8 +38,8 @@
 #define JIT_LAZYSTORE 1
 
 static int DEBUG_FUNC = 335;
-static int LSTORE_MIN = 0;  // 412 - 425
-static int LSTORE_MAX = 99999;
+static int LSTORE_MIN = 25550;
+static int LSTORE_MAX = 25550;
 
 typedef enum {
 	Eax = 0,
@@ -1175,6 +1175,23 @@ static preg *alloc_cpu( jit_ctx *ctx, vreg *r, bool andLoad ) {
 	return p;
 }
 
+// Prepare a register for a destructive two-operand instruction (e.g. ADD, MULSD).
+// x86 two-operand ops like ADDSD/MULSD overwrite their first operand in place.
+// Previously we used scratch(pa) to flush and unbind 'from', but with lazy stores
+// (lstore) that caused corruption: the post-op value in pa would be flushed back
+// to the *source* vreg's stack slot instead of the destination's.
+// Instead, if 'from' is still bound to a live vreg other than dst, we allocate a
+// fresh register and copy into it, so the source vreg is never clobbered.
+static preg *alloc_result( jit_ctx *ctx, vreg *dst, preg *from ) {
+	if( dst == NULL || from->holds == NULL || from->holds == dst )
+		return from;
+	RLOCK(from);
+	preg *out = alloc_reg(ctx, from->kind);
+	copy(ctx, out, from, from->holds->size);
+	RUNLOCK(from);
+	return out;
+}
+
 // allocate a register that is not a call parameter
 static preg *alloc_cpu_call( jit_ctx *ctx, vreg *r ) {
 	preg *p = fetch(r);
@@ -2112,9 +2129,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			scratch(pa);
-			op32(ctx, o, pa, pb);
-			out = pa;
+			out = alloc_result(ctx, dst, pa);
+			op32(ctx, o, out, pb);
 			break;
 		case ID2(RSTACK,RCPU):
 			if( dst == a && o != IMUL ) {
@@ -2154,9 +2170,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RCPU,RCPU):
 		case ID2(RCPU,RSTACK):
-			scratch(pa);
-			op64(ctx, o, pa, pb);
-			out = pa;
+			out = alloc_result(ctx, dst, pa);
+			op64(ctx, o, out, pb);
 			break;
 		case ID2(RSTACK,RCPU):
 			if( dst == a && OP_FORMS[o].mem_r ) {
@@ -2184,7 +2199,8 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 		pb = alloc_fpu(ctx, b, true);
 		switch( ID2(pa->kind, pb->kind) ) {
 		case ID2(RFPU,RFPU):
-			op64(ctx,o,pa,pb);
+			out = alloc_result(ctx, dst, pa);
+			op64(ctx, o, out, pb);
 			if( (o == COMISD || o == COMISS) && bop != OJSGt ) {
 				int jnotnan;
 				XJump_small(JNParity,jnotnan);
@@ -2221,8 +2237,6 @@ static preg *op_binop( jit_ctx *ctx, vreg *dst, vreg *a, vreg *b, hl_op bop ) {
 				}
 				patch_jump(ctx,jnotnan);
 			}
-			// scratch(pa);
-			out = pa;
 			break;
 		default:
 			printf("%s(%d,%d)\n", hl_op_name(bop), pa->kind, pb->kind);
