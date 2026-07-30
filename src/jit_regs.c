@@ -50,6 +50,7 @@ typedef struct {
 	int last_read;
 	int tot_reads;
 	int tracked;
+	int track_reg; // hl register of the tracked variable, valid if tracked
 	int overwrite;
 	emit_mode mode;
 	ereg pref_reg;
@@ -750,18 +751,14 @@ void hl_regs_flush( jit_ctx *jit ) {
 
 	int_arr regs_track;
 	int_arr_free(&regs_track);
-	int rarg = 0;
 	int end_pos = ctx->emit_pos;
 	for(int i=0;i<jit->value_count + jit->phi_count;i++) {
 		value_info *v = VAL(i);
 		if( v->tracked && v->reg ) {
 			int start = ctx->pos_map[v->start];
 			int end = v->overwrite < 0 ? end_pos : ctx->pos_map[v->last_read];
-			int track = (v->tracked - 1) << 1;
-//			printf("  @%X-%X %s := %s\n", start, end, jit->mod->code->strings[jit->fun->assigns[track]], val_str(v->reg,v->mode));
-			int assign = jit->fun->assigns[track+1];
-			if( assign < 0 ) assign = rarg++;
-			int_arr_add(regs_track, assign);
+//			printf("  @%X-%X %s := %s\n", start, end, jit->mod->code->strings[jit->fun->assigns[(v->tracked - 1) << 1]], val_str(v->reg,v->mode));
+			int_arr_add(regs_track, v->track_reg);
 			int_arr_add(regs_track, start);
 			int_arr_add(regs_track, end);
 			int_arr_add(regs_track, v->reg);
@@ -805,8 +802,9 @@ void hl_regs_function( jit_ctx *jit ) {
 		}
 	}
 	for(int i=0;i<jit->track_count;i++) {
-		int v = jit->values_track[(i<<1)|1];
-		VAL(v)->tracked = jit->values_track[i<<1] + 1;
+		int *t = jit->values_track + i * VALUES_TRACK_STRIDE;
+		VAL(t[1])->tracked = t[0] + 1;
+		VAL(t[1])->track_reg = t[2];
 	}
 	for(int b=0;b<jit->block_count;b++) {
 		eblock *bl = jit->blocks + b;
@@ -815,8 +813,10 @@ void hl_regs_function( jit_ctx *jit ) {
 			value_info *v = VAL_REG(ph->value);
 			v->start = bl->start_pos;
 			v->mode = ph->mode;
-			if( ph->nvalues )
+			if( ph->nvalues ) {
 				v->tracked = VAL_REG(ph->values[0])->tracked;
+				v->track_reg = VAL_REG(ph->values[0])->track_reg;
+			}
 		}
 	}
 	regs_compute_liveness(ctx);

@@ -136,6 +136,12 @@ typedef enum {
 #define IS_CALL(op)	((op) == CALL_PTR || (op) == CALL_REG || (op) == CALL_FUN)
 #define IS_FLOAT(mode)	((mode) == M_F64 || (mode) == M_F32)
 
+// jit->values_track : one record per tracked variable assignment,
+// { assigns index, value, hl register }. the hl register is stored at emit time
+// because it cannot be recovered from assigns[] afterwards, where all the
+// arguments share the position -1.
+#define VALUES_TRACK_STRIDE	3
+
 #define MAX_ARGS	16
 
 #if defined(HL_WIN_CALL) && defined(HL_64)

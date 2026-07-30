@@ -169,6 +169,12 @@ struct _emit_ctx {
 #define GET_PHI(r) ctx->phis[-(r)-1]
 #define HDYN_VALUE 8
 
+static void values_track_add( emit_ctx *ctx, int assign, ereg value, int hl_reg ) {
+	int_arr_add(ctx->values_track,assign);
+	int_arr_add(ctx->values_track,value);
+	int_arr_add(ctx->values_track,hl_reg);
+}
+
 static hl_type hlt_ui8 = { HUI8, 0 };
 static hl_type hlt_ui16 = { HUI16, 0 };
 
@@ -505,9 +511,8 @@ static void emit_store_reg( emit_ctx *ctx, vreg *to, ereg v ) {
 	} else {
 		to->stored = v;
 		if( ctx->current_assign < ctx->fun->nassigns && ctx->fun->assigns[(ctx->current_assign<<1)|1] == ctx->op_pos ) {
-			int_arr_add(ctx->values_track,ctx->current_assign);
-			int_arr_add(ctx->values_track,v);
 			//printf("@%X R%d[%s] := V%d\n",ctx->emit_pos - 1, to->id, ctx->jit->mod->code->strings[ctx->fun->assigns[(ctx->current_assign<<1)]], v);
+			values_track_add(ctx, ctx->current_assign, v, to->id);
 			ctx->current_assign++;
 		}
 	}
@@ -886,7 +891,7 @@ void hl_emit_flush( jit_ctx *jit ) {
 	jit->blocks = hl_zalloc(&jit->falloc,sizeof(eblock) * jit->block_count);
 	jit->value_count = int_arr_count(ctx->values);
 	jit->values_writes = ctx->values.values;
-	jit->track_count = int_arr_count(ctx->values_track) >> 1;
+	jit->track_count = int_arr_count(ctx->values_track) / VALUES_TRACK_STRIDE;
 	jit->values_track = ctx->values_track.values;
 	for_iter(blocks,b,ctx->blocks)
 		emit_write_block(ctx,b);
@@ -1036,14 +1041,20 @@ void hl_emit_function( jit_ctx *jit ) {
 
 	emit_gen_size(ctx, BLOCK, 0);
 	emit_gen(ctx,ENTER,UNUSED,UNUSED,M_NONE);
+	// assigns position encoding : -1 is an argument, <= -2 a variable bound to hl
+	// register (-position - 2), >= 0 a variable assigned at that op position.
+	// the leading <= -2 entries are not arguments, skip them.
+	while( ctx->current_assign < f->nassigns && f->assigns[(ctx->current_assign<<1)|1] <= -2 )
+		ctx->current_assign++;
 	for(i=0;i<f->type->fun->nargs;i++) {
 		hl_type *t = f->type->fun->args[i];
 		ereg r = emit_gen(ctx, LOAD_ARG, UNUSED, UNUSED, hl_type_mode(t));
 		STORE(R(i), r);
-		if( ctx->current_assign < f->nassigns && f->assigns[(ctx->current_assign<<1)|1] < 0 ) {
+		// only match -1 here : testing < 0 would also consume the register-bound
+		// entries and desync current_assign for the rest of the function
+		if( ctx->current_assign < f->nassigns && f->assigns[(ctx->current_assign<<1)|1] == -1 ) {
 			//printf("@%X R%d[%s] := V%d\n",ctx->emit_pos - 1, i, ctx->jit->mod->code->strings[f->assigns[(ctx->current_assign<<1)]], r);
-			int_arr_add(ctx->values_track,ctx->current_assign);
-			int_arr_add(ctx->values_track,r);
+			values_track_add(ctx, ctx->current_assign, r, i);
 			ctx->current_assign++;
 		}
 	}
